@@ -1,8 +1,19 @@
-"""Program entry point. Run: python -X utf8 -m app.demo"""
+"""Program entry point. Run: python -X utf8 -m app.demo
+
+数据流（STEP 3 起）：
+    inventory.csv（库存事实） + orders.csv（订单事实）
+        → app.demand.calculate_demand()   (Demand Engine)
+        → app.inventory.analyze_inventory_frame()   (库存决策)
+        → 打印
+本模块只负责「加载 → 调用 → 展示」，不复制任何计算。
+"""
+from datetime import date
+
 import pandas as pd
 
-from app.data_loader import load_inventory
-from app.inventory import analyze_frame
+from app.data_loader import load_inventory, load_orders
+from app.demand import calculate_demand
+from app.inventory import analyze_inventory_frame
 
 
 def format_number(value) -> str:
@@ -15,8 +26,15 @@ def format_number(value) -> str:
     return f"{float(value):.10f}".rstrip("0").rstrip(".")
 
 
-def main():
-    results = analyze_frame(load_inventory())
+def main(as_of_date: date | None = None):
+    # as_of_date 默认今天：边界层唯一允许读取系统时间的地方。
+    # 测试传入固定日期（如 date(2026, 9, 20)）即可得到确定性输出。
+    if as_of_date is None:
+        as_of_date = date.today()
+
+    # 日均需求一律来自 Demand Engine（daily_demand_30d），不再来自 inventory.csv
+    demand = calculate_demand(load_orders(), as_of_date)
+    results = analyze_inventory_frame(load_inventory(), demand)
     print("=" * 40)
     print("SupplyChain OS")
     print("Inventory Decision Engine")

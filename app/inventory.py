@@ -1,10 +1,20 @@
-"""Core inventory calculations."""
-from dataclasses import asdict, dataclass, fields
+"""Core inventory calculations.
+
+输入契约（STEP 3 起）：
+    库存事实（inventory.csv）+ Demand Engine 输出（app/demand.py）
+    `daily_demand` 一律来自 Demand Engine，**不再来自 inventory.csv**。
+"""
+from dataclasses import asdict, dataclass, fields, replace
 
 import pandas as pd
 
+from app.demand import COLUMNS as _DEMAND_COLUMNS
+
 # fields analyze_inventory() needs; other CSV columns are ignored
 FIELDS = ("sku", "current_stock", "daily_demand", "safety_stock", "lead_time_days")
+
+# Demand Engine 的输出列（除 sku 外），随决策结果一起传递，不改写、不覆盖
+DEMAND_COLUMNS = tuple(c for c in _DEMAND_COLUMNS if c != "sku")
 
 
 @dataclass
@@ -108,3 +118,54 @@ def analyze_frame(df: pd.DataFrame) -> BatchResult:
         skipped_count=len(warnings),
         warnings=warnings,
     )
+
+
+# --- assembly: inventory facts + Demand Engine -> analyze_frame ----------
+
+def analyze_inventory_frame(inventory_df: pd.DataFrame, demand_df: pd.DataFrame) -> BatchResult:
+    """装配入口：库存事实 + Demand Engine 输出 -> BatchResult。
+
+    按 sku 做显式 1:1 对齐（不 drop、不 fill、不猜），对齐规则见 _aligned_snapshot()。
+    demand 的口径、质量结论原样传递到结果帧，不做任何改写。
+    """
+    aligned = _aligned_snapshot(inventory_df, demand_df)
+    batch = analyze_frame(aligned)
+    return replace(
+        batch,
+        frame=batch.frame.merge(aligned[["sku", *DEMAND_COLUMNS]], on="sku", how="left"),
+    )
+
+
+def _aligned_snapshot(inventory_df: pd.DataFrame, demand_df: pd.DataFrame) -> pd.DataFrame:
+    """把 Demand Engine 输出接到库存事实上，产出 analyze_frame() 能吃的单表快照。
+
+    `daily_demand` = Demand Engine 的 `daily_demand_30d`（STEP 3 口径，
+    不用 7D、不做加权——那属于后续需求策略迭代）。
+    """
+    if "daily_demand" in inventory_df.columns:
+        raise ValueError(
+            "inventory contains daily_demand: demand must come from the Demand Engine, "
+            "not from the inventory table"
+        )
+
+    _check_unique_sku(inventory_df, "inventory")
+    _check_unique_sku(demand_df, "demand")
+
+    inventory_skus = pd.Index(inventory_df["sku"])
+    demand_skus = pd.Index(demand_df["sku"])
+    missing = sorted(inventory_skus.difference(demand_skus).tolist())
+    if missing:
+        raise ValueError(f"missing demand for SKU: {missing}")
+    extra = sorted(demand_skus.difference(inventory_skus).tolist())
+    if extra:
+        raise ValueError(f"extra demand SKU: {extra}")
+
+    aligned = inventory_df.merge(demand_df[["sku", *DEMAND_COLUMNS]], on="sku", how="left")
+    aligned["daily_demand"] = aligned["daily_demand_30d"]
+    return aligned
+
+
+def _check_unique_sku(df: pd.DataFrame, label: str) -> None:
+    duplicates = sorted(df["sku"][df["sku"].duplicated()].unique().tolist())
+    if duplicates:
+        raise ValueError(f"duplicate {label} SKU: {duplicates}")
