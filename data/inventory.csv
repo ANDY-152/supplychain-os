@@ -1,0 +1,6 @@
+sku,current_stock,daily_demand,safety_stock,lead_time_days
+SKU001,1200,80,500,5
+SKU002,500,100,300,7
+SKU003,5000,20,500,10
+SKU004,200,80,400,5
+SKU005,1500,50,400,3

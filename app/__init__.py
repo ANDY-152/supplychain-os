@@ -1,0 +1,1 @@
+"""SupplyChain OS application package."""
