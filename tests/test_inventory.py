@@ -366,6 +366,269 @@ def test_report():
     assert ".0\n" not in out
 
 
+# --- STEP 4: in_transit -> inventory position -------------------------------
+
+def transit_rows(*rows) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["po_id", "sku", "qty", "expected_date", "status"])
+
+
+def step4_row(current_stock, in_transit_qty, *, expected_date="2026-09-25", status="OPEN"):
+    """单 SKU 端到端（ROP = 10*5 + 50 = 100）。"""
+    inventory = inventory_rows(("SKU001", current_stock, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows(("PO-1", "SKU001", in_transit_qty, expected_date, status))
+    return analyze_inventory_frame(inventory, demand, transit, AS_OF).frame.iloc[0]
+
+
+def test_no_in_transit_keeps_the_v02_behaviour():
+    # A: current=50, in_transit=0, ROP=100 → 50
+    row = analyze_inventory("SKU001", 50, 10, 50, 5, in_transit_stock=0)
+    assert row.reorder_point == 100
+    assert row.inventory_position == 50
+    assert row.recommended_order_qty == 50
+    assert row.reason == "STOCK_BELOW_REORDER_POINT"
+
+
+def test_sufficient_in_transit_drops_the_order_to_zero():
+    # B: current=50, in_transit=100, ROP=100 → position=150, qty=0，但 status 仍是 REORDER
+    row = step4_row(50, 100)
+    assert row.inventory_position == 150
+    assert row.recommended_order_qty == 0
+    assert row.status == "REORDER"  # status 只看现货（第五、R 条）
+    assert row.reason == "IN_TRANSIT_COVERS_SHORTAGE"
+
+
+def test_insufficient_in_transit_only_covers_part():
+    # C: current=50, in_transit=20, ROP=100 → position=70, qty=30
+    row = step4_row(50, 20)
+    assert row.inventory_position == 70
+    assert row.recommended_order_qty == 30
+    assert row.reason == "IN_TRANSIT_INSUFFICIENT"
+
+
+def test_coverage_days_still_uses_current_stock_only():
+    # D: 在途不得进入 coverage_days 分子（5 天而不是 15 天）
+    row = step4_row(50, 100)
+    assert row.coverage_days == 5.0
+    assert row.coverage_days != 15.0
+    assert row.inventory_position == 150  # 两个指标同时存在
+
+
+def test_overdue_open_is_still_counted_once():
+    # E: OPEN + 已逾期（expected 2026-09-15 < as_of 2026-09-20）仍计入，不自动删除、不重复相加
+    row = step4_row(50, 500, expected_date="2026-09-15")
+    assert row.in_transit_stock == 500
+    assert row.overdue_in_transit == 500
+    assert row.inventory_position == 550  # 500 只加一次
+    assert row.recommended_order_qty == 0
+
+
+def test_arrived_is_not_counted():
+    # F
+    row = step4_row(50, 400, status="ARRIVED")
+    assert row.in_transit_stock == 0
+    assert row.overdue_in_transit == 0
+    assert row.inventory_position == 50
+    assert row.recommended_order_qty == 50
+
+
+def test_cancelled_is_not_counted():
+    # G
+    row = step4_row(50, 150, status="CANCELLED")
+    assert row.in_transit_stock == 0
+    assert row.inventory_position == 50
+    assert row.recommended_order_qty == 50
+
+
+def test_multiple_po_for_same_sku_sums_open_only():
+    # H: 600 OPEN + 150 CANCELLED → 600（不是 750）
+    inventory = inventory_rows(("SKU002", 50, 50, 5))
+    demand = demand_rows(("SKU002", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows(
+        ("PO-1", "SKU002", 600, "2026-09-25", "OPEN"),
+        ("PO-2", "SKU002", 150, "2026-10-08", "CANCELLED"),
+    )
+    row = analyze_inventory_frame(inventory, demand, transit, AS_OF).frame.iloc[0]
+    assert row.in_transit_stock == 600
+
+
+def test_each_sku_is_aggregated_independently():
+    # I
+    inventory = inventory_rows(("SKU001", 50, 50, 5), ("SKU002", 50, 50, 5))
+    demand = demand_rows(
+        ("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"),
+        ("SKU002", 10.0, 10.0, "STABLE", 30, 10, "OK"),
+    )
+    transit = transit_rows(
+        ("PO-1", "SKU001", 20, "2026-09-25", "OPEN"),
+        ("PO-2", "SKU002", 100, "2026-09-25", "OPEN"),
+    )
+    frame = analyze_inventory_frame(inventory, demand, transit, AS_OF).frame.set_index("sku")
+    assert frame.loc["SKU001", "in_transit_stock"] == 20
+    assert frame.loc["SKU002", "in_transit_stock"] == 100
+    assert frame.loc["SKU001", "recommended_order_qty"] == 30
+    assert frame.loc["SKU002", "recommended_order_qty"] == 0
+
+
+def _transit_failure(po_id, sku, qty, expected_date, status):
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows((po_id, sku, qty, expected_date, status))
+    return analyze_inventory_frame(inventory, demand, transit, AS_OF)
+
+
+def test_invalid_status_fails():
+    # J: OPNE 不得被静默转成 OPEN
+    try:
+        _transit_failure("PO-1", "SKU001", 10, "2026-09-25", "OPNE")
+    except ValueError as e:
+        assert "invalid status" in str(e) and "OPNE" in str(e)
+        return
+    raise AssertionError("invalid status must raise ValueError")
+
+
+def test_invalid_expected_date_fails():
+    # K
+    try:
+        _transit_failure("PO-1", "SKU001", 10, "2026/09/25", "OPEN")
+    except ValueError as e:
+        assert "invalid expected_date" in str(e)
+        return
+    raise AssertionError("invalid expected_date must raise ValueError")
+
+
+def test_zero_qty_fails():
+    # L
+    try:
+        _transit_failure("PO-1", "SKU001", 0, "2026-09-25", "OPEN")
+    except ValueError as e:
+        assert "in_transit qty must be > 0" in str(e) and "PO-1" in str(e)
+        return
+    raise AssertionError("qty=0 must raise ValueError")
+
+
+def test_negative_qty_fails():
+    # M
+    try:
+        _transit_failure("PO-1", "SKU001", -5, "2026-09-25", "OPEN")
+    except ValueError as e:
+        assert "in_transit qty must be > 0" in str(e)
+        return
+    raise AssertionError("negative qty must raise ValueError")
+
+
+def test_null_qty_fails():
+    try:
+        _transit_failure("PO-1", "SKU001", None, "2026-09-25", "OPEN")
+    except ValueError as e:
+        assert "null qty" in str(e)
+        return
+    raise AssertionError("null qty must raise ValueError")
+
+
+def test_unknown_in_transit_sku_fails():
+    # N: in_transit 有 SKU999 但 inventory 没有 → 必须失败并指出 SKU999
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows(("PO-1", "SKU999", 10, "2026-09-25", "OPEN"))
+    try:
+        analyze_inventory_frame(inventory, demand, transit, AS_OF)
+    except ValueError as e:
+        assert "extra in_transit SKU" in str(e) and "SKU999" in str(e)
+        return
+    raise AssertionError("unknown in_transit SKU must raise ValueError")
+
+
+def test_inventory_sku_without_transit_record_is_zero_not_an_error():
+    # O: inventory 有 SKU 但 in_transit 无记录 = 0（业务事实，不是缺失数据）
+    inventory = inventory_rows(("SKU001", 50, 50, 5), ("SKU002", 50, 50, 5))
+    demand = demand_rows(
+        ("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"),
+        ("SKU002", 10.0, 10.0, "STABLE", 30, 10, "OK"),
+    )
+    transit = transit_rows(("PO-1", "SKU001", 20, "2026-09-25", "OPEN"))
+    batch = analyze_inventory_frame(inventory, demand, transit, AS_OF)
+    frame = batch.frame.set_index("sku")
+    assert batch.analyzed_count == 2  # 不报错、不丢行
+    assert frame.loc["SKU002", "in_transit_stock"] == 0
+    assert frame.loc["SKU002", "recommended_order_qty"] == 50
+
+
+def test_unknown_history_still_passed_through_with_transit():
+    # P: STEP 3 行为不变
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 12.0, "INCREASING", None, 4, "UNKNOWN_HISTORY"))
+    transit = transit_rows(("PO-1", "SKU001", 100, "2026-09-25", "OPEN"))
+    row = analyze_inventory_frame(inventory, demand, transit, AS_OF).frame.iloc[0]
+    assert row.data_quality_status == "UNKNOWN_HISTORY"
+    assert row.history_days is None
+    assert row.order_active_days == 4
+
+
+def test_demand_input_is_still_30d_with_transit():
+    # Q: STEP 3 行为不变
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 20.0, "INCREASING", 30, 10, "OK"))
+    transit = transit_rows(("PO-1", "SKU001", 100, "2026-09-25", "OPEN"))
+    row = analyze_inventory_frame(inventory, demand, transit, AS_OF).frame.iloc[0]
+    assert row.daily_demand == 10.0  # 不是 20.0
+    assert row.reorder_point == 10.0 * 5 + 50
+
+
+def test_status_still_follows_current_stock_only():
+    # R: 现货 30 < safety 50 → CRITICAL，即使有 1000 在途
+    row = step4_row(30, 1000)
+    assert row.status == "CRITICAL"
+    assert row.inventory_position == 1030
+    assert row.recommended_order_qty == 0
+    assert row.reason == "IN_TRANSIT_COVERS_SHORTAGE"
+
+
+def test_duplicate_po_id_fails():
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows(
+        ("PO-1", "SKU001", 10, "2026-09-25", "OPEN"),
+        ("PO-1", "SKU001", 20, "2026-09-26", "OPEN"),
+    )
+    try:
+        analyze_inventory_frame(inventory, demand, transit, AS_OF)
+    except ValueError as e:
+        assert "duplicate po_id" in str(e) and "PO-1" in str(e)
+        return
+    raise AssertionError("duplicate po_id must raise ValueError")
+
+
+def test_as_of_date_is_required_when_transit_is_provided():
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows(("PO-1", "SKU001", 10, "2026-09-25", "OPEN"))
+    try:
+        analyze_inventory_frame(inventory, demand, transit)  # 不给 as_of_date
+    except TypeError as e:
+        assert "as_of_date" in str(e)
+        return
+    raise AssertionError("as_of_date must be required when in_transit_df is given")
+
+
+def test_analyze_inventory_rejects_bad_transit_numbers():
+    for bad in ({"in_transit_stock": -1}, {"overdue_in_transit": -1}, {"overdue_in_transit": 10}):
+        args = {"sku": "S", "current_stock": 50, "daily_demand": 10, "safety_stock": 50, "lead_time_days": 5}
+        try:
+            analyze_inventory(**args, **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} must raise ValueError")
+
+
+def test_transit_absent_means_not_wired_not_zero_records():
+    # in_transit_df=None：本次未接入在途数据（与“没有 OPEN 记录”区分）
+    batch = analyze_inventory_frame(load_inventory(), real_demand())
+    assert (batch.frame.in_transit_stock == 0).all()
+    assert (batch.frame.overdue_in_transit == 0).all()
+    assert (batch.frame.inventory_position == batch.frame.current_stock).all()
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
