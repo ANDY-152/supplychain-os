@@ -159,7 +159,10 @@ def test_real_file_has_all_statuses():
 
 
 def test_real_files_load():
-    assert load_inventory().shape == (5, 5)
+    # loader 契约测试：inventory.csv 不再包含 daily_demand（V0.2 STEP 1）
+    inventory = load_inventory()
+    assert inventory.shape == (5, 4)
+    assert "daily_demand" not in inventory.columns
     assert list(load_csv("products.csv").columns) == ["sku", "product_name", "category"]
 
 
@@ -167,7 +170,7 @@ def test_missing_columns_rejected():
     try:
         load_inventory("products.csv")  # lacks the stock columns
     except ValueError as e:
-        assert "daily_demand" in str(e)
+        assert "current_stock" in str(e)
         return
     raise AssertionError("products.csv should not pass as inventory")
 
