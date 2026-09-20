@@ -2,11 +2,12 @@
 import io
 from contextlib import redirect_stdout
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 
 from app import demo
-from app.data_loader import load_csv, load_inventory, load_orders
+from app.data_loader import load_csv, load_in_transit, load_inventory, load_orders
 from app.demand import calculate_demand
 from app.inventory import (
     DEMAND_COLUMNS,
@@ -49,6 +50,7 @@ def test_normal_inventory():
         daily_demand=80,
         safety_stock=500,
         lead_time_days=5,
+        as_of_date=AS_OF,
     )
     assert result.coverage_days == 15
     assert result.reorder_point == 900
@@ -63,6 +65,7 @@ def test_reorder_inventory():
         daily_demand=100,
         safety_stock=300,
         lead_time_days=7,
+        as_of_date=AS_OF,
     )
     assert result.status == "REORDER"
     assert result.recommended_order_qty == 500
@@ -75,6 +78,7 @@ def test_critical_inventory():
         daily_demand=80,
         safety_stock=400,
         lead_time_days=5,
+        as_of_date=AS_OF,
     )
     assert result.status == "CRITICAL"
     assert result.recommended_order_qty == 600
@@ -87,6 +91,7 @@ def test_overstock_inventory():
         daily_demand=20,
         safety_stock=500,
         lead_time_days=10,
+        as_of_date=AS_OF,
     )
     assert result.status == "OVERSTOCK"
     assert result.recommended_order_qty == 0
@@ -94,7 +99,7 @@ def test_overstock_inventory():
 
 def test_never_recommends_negative_qty():
     assert all(
-        analyze_inventory(f"S{i}", stock, 10, 100, 5).recommended_order_qty >= 0
+        analyze_inventory(f"S{i}", stock, 10, 100, 5, as_of_date=AS_OF).recommended_order_qty >= 0
         for i, stock in enumerate([0, 100, 500, 5000])
     )
 
@@ -107,6 +112,7 @@ def test_invalid_demand():
             daily_demand=0,
             safety_stock=300,
             lead_time_days=5,
+            as_of_date=AS_OF,
         )
     except ValueError:
         assert True
@@ -125,7 +131,7 @@ def test_null_values_rejected():
         }
         args[field] = float("nan")
         try:
-            analyze_inventory(**args)
+            analyze_inventory(**args, as_of_date=AS_OF)
         except ValueError as e:
             assert field in str(e), e
         else:
@@ -134,7 +140,7 @@ def test_null_values_rejected():
 
 def test_extra_columns_ignored():
     inventory = load_inventory().assign(supplier="Acme", unit_cost=1.5, category="A", warehouse="WH1")
-    batch = analyze_inventory_frame(inventory, real_demand())
+    batch = analyze_inventory_frame(inventory, real_demand(), as_of_date=AS_OF)
     assert batch.analyzed_count == 5
     assert batch.skipped_count == 0
     assert batch.frame.iloc[0].sku == "SKU004"
@@ -146,7 +152,7 @@ def test_wiring_uses_daily_demand_30d_from_demand_engine():
     # A: 库存决策使用的是 Demand Engine 的 daily_demand_30d
     inventory = inventory_rows(("SKU001", 1200, 500, 5))
     demand = demand_rows(("SKU001", 12.5, 20.0, "INCREASING", 30, 10, "OK"))
-    row = analyze_inventory_frame(inventory, demand).frame.iloc[0]
+    row = analyze_inventory_frame(inventory, demand, as_of_date=AS_OF).frame.iloc[0]
 
     assert row.daily_demand == 12.5
     assert row.daily_demand_30d == 12.5
@@ -158,7 +164,7 @@ def test_inventory_frame_needs_only_stock_columns():
     # B: 库存表只有 4 列（无 daily_demand）就能完成决策
     inventory = load_inventory()
     assert list(inventory.columns) == ["sku", "current_stock", "safety_stock", "lead_time_days"]
-    batch = analyze_inventory_frame(inventory, real_demand())
+    batch = analyze_inventory_frame(inventory, real_demand(), as_of_date=AS_OF)
     assert batch.analyzed_count == 5
     assert batch.skipped_count == 0
     assert "daily_demand" not in inventory.columns
@@ -169,7 +175,7 @@ def test_inventory_daily_demand_is_rejected():
     inventory = inventory_rows(("SKU001", 1200, 500, 5)).assign(daily_demand=999)
     demand = demand_rows(("SKU001", 12.5, 12.5, "STABLE", 30, 10, "OK"))
     try:
-        analyze_inventory_frame(inventory, demand)
+        analyze_inventory_frame(inventory, demand, as_of_date=AS_OF)
     except ValueError as e:
         assert "daily_demand" in str(e) and "Demand Engine" in str(e)
         return
@@ -181,7 +187,7 @@ def test_missing_demand_for_sku_fails():
     inventory = inventory_rows(("SKU001", 1200, 500, 5), ("SKU002", 500, 300, 7))
     demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
     try:
-        analyze_inventory_frame(inventory, demand)
+        analyze_inventory_frame(inventory, demand, as_of_date=AS_OF)
     except ValueError as e:
         assert "missing demand" in str(e) and "SKU002" in str(e)
         return
@@ -196,7 +202,7 @@ def test_extra_demand_sku_fails():
         ("SKU999", 5.0, 5.0, "STABLE", 30, 5, "OK"),
     )
     try:
-        analyze_inventory_frame(inventory, demand)
+        analyze_inventory_frame(inventory, demand, as_of_date=AS_OF)
     except ValueError as e:
         assert "extra demand SKU" in str(e) and "SKU999" in str(e)
         return
@@ -208,7 +214,7 @@ def test_duplicate_inventory_sku_fails():
     inventory = inventory_rows(("SKU001", 1200, 500, 5), ("SKU001", 900, 500, 5))
     demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
     try:
-        analyze_inventory_frame(inventory, demand)
+        analyze_inventory_frame(inventory, demand, as_of_date=AS_OF)
     except ValueError as e:
         assert "duplicate inventory SKU" in str(e) and "SKU001" in str(e)
         return
@@ -223,7 +229,7 @@ def test_duplicate_demand_sku_fails():
         ("SKU001", 11.0, 11.0, "STABLE", 30, 10, "OK"),
     )
     try:
-        analyze_inventory_frame(inventory, demand)
+        analyze_inventory_frame(inventory, demand, as_of_date=AS_OF)
     except ValueError as e:
         assert "duplicate demand SKU" in str(e) and "SKU001" in str(e)
         return
@@ -234,7 +240,7 @@ def test_unknown_history_is_passed_through_unchanged():
     # G: UNKNOWN_HISTORY / history_days=None 必须原样传到决策结果
     inventory = inventory_rows(("SKU001", 1200, 500, 5))
     demand = demand_rows(("SKU001", 10.0, 12.0, "INCREASING", None, 4, "UNKNOWN_HISTORY"))
-    row = analyze_inventory_frame(inventory, demand).frame.iloc[0]
+    row = analyze_inventory_frame(inventory, demand, as_of_date=AS_OF).frame.iloc[0]
 
     assert row.data_quality_status == "UNKNOWN_HISTORY"
     assert row.data_quality_status != "INSUFFICIENT_HISTORY"
@@ -245,7 +251,7 @@ def test_unknown_history_is_passed_through_unchanged():
 
 def test_demand_columns_are_kept_in_the_decision_output():
     inventory = load_inventory()
-    frame = analyze_inventory_frame(inventory, real_demand()).frame
+    frame = analyze_inventory_frame(inventory, real_demand(), as_of_date=AS_OF).frame
     assert set(DEMAND_COLUMNS) <= set(frame.columns)
     assert set(frame.sku) == set(inventory.sku)  # 无 drop、无新增
     assert len(frame) == len(inventory)
@@ -255,7 +261,7 @@ def test_trend_and_7d_do_not_change_the_demand_input():
     # H: 7D 与 trend 不参与库存决策，daily_demand 仍是 30D
     inventory = inventory_rows(("SKU001", 1200, 500, 5))
     demand = demand_rows(("SKU001", 10.0, 20.0, "INCREASING", 30, 10, "OK"))
-    row = analyze_inventory_frame(inventory, demand).frame.iloc[0]
+    row = analyze_inventory_frame(inventory, demand, as_of_date=AS_OF).frame.iloc[0]
 
     assert row.daily_demand == 10.0  # 不是 20.0，也不是 0.5*30D+0.5*7D
     assert row.reorder_point == 10.0 * 5 + 500
@@ -272,7 +278,7 @@ def test_batch_skips_bad_rows():
             "lead_time_days": [5, 7, 10, 5, 3],
         }
     )
-    batch = analyze_frame(df)
+    batch = analyze_frame(df, AS_OF)
 
     assert batch.analyzed_count == 4
     assert batch.skipped_count == 1
@@ -298,7 +304,7 @@ def test_all_rows_bad_returns_empty_with_warnings():
             "lead_time_days": [5, 7],
         }
     )
-    batch = analyze_frame(df)
+    batch = analyze_frame(df, AS_OF)
 
     assert batch.analyzed_count == 0
     assert batch.skipped_count == 2
@@ -312,7 +318,7 @@ def test_real_file_has_all_statuses():
     # 输入调整（不改断言）：把 SKU002 的现货调到 [safety, reorder_point) 区间，
     # 让 4 种状态在真实数据上同时出现（300 <= 350 < 13.0*7+300 = 391）
     inventory.loc[inventory.sku == "SKU002", "current_stock"] = 350
-    out = analyze_inventory_frame(inventory, real_demand()).frame
+    out = analyze_inventory_frame(inventory, real_demand(), as_of_date=AS_OF).frame
     assert set(out.status) == {"CRITICAL", "REORDER", "OVERSTOCK", "NORMAL"}
     assert out.iloc[0].sku == "SKU004"  # sorted by coverage, worse first
 
@@ -382,7 +388,7 @@ def step4_row(current_stock, in_transit_qty, *, expected_date="2026-09-25", stat
 
 def test_no_in_transit_keeps_the_v02_behaviour():
     # A: current=50, in_transit=0, ROP=100 → 50
-    row = analyze_inventory("SKU001", 50, 10, 50, 5, in_transit_stock=0)
+    row = analyze_inventory("SKU001", 50, 10, 50, 5, in_transit_stock=0, as_of_date=AS_OF)
     assert row.reorder_point == 100
     assert row.inventory_position == 50
     assert row.recommended_order_qty == 50
@@ -615,7 +621,7 @@ def test_analyze_inventory_rejects_bad_transit_numbers():
     for bad in ({"in_transit_stock": -1}, {"overdue_in_transit": -1}, {"overdue_in_transit": 10}):
         args = {"sku": "S", "current_stock": 50, "daily_demand": 10, "safety_stock": 50, "lead_time_days": 5}
         try:
-            analyze_inventory(**args, **bad)
+            analyze_inventory(**args, **bad, as_of_date=AS_OF)
         except ValueError:
             continue
         raise AssertionError(f"{bad} must raise ValueError")
@@ -623,10 +629,296 @@ def test_analyze_inventory_rejects_bad_transit_numbers():
 
 def test_transit_absent_means_not_wired_not_zero_records():
     # in_transit_df=None：本次未接入在途数据（与“没有 OPEN 记录”区分）
-    batch = analyze_inventory_frame(load_inventory(), real_demand())
+    batch = analyze_inventory_frame(load_inventory(), real_demand(), as_of_date=AS_OF)
     assert (batch.frame.in_transit_stock == 0).all()
     assert (batch.frame.overdue_in_transit == 0).all()
     assert (batch.frame.inventory_position == batch.frame.current_stock).all()
+
+
+def test_as_of_date_is_required_even_without_transit():
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows(("PO-1", "SKU001", 10, "2026-09-25", "OPEN"))
+    for call in (
+        lambda: analyze_inventory_frame(inventory, demand, transit),  # 有在途、无 as_of_date
+        lambda: analyze_inventory_frame(inventory, demand),           # 无在途、无 as_of_date
+    ):
+        try:
+            call()
+        except TypeError as e:
+            assert "as_of_date" in str(e)
+            continue
+        raise AssertionError("as_of_date must be required for any decision")
+
+
+# --- STEP 5: decision evidence (as_of_date / demand_basis / shortage_qty) ---
+
+def _transit_row_at(as_of, expected_date):
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    transit = transit_rows(("PO-1", "SKU001", 100, expected_date, "OPEN"))
+    return analyze_inventory_frame(inventory, demand, transit, as_of).frame.iloc[0]
+
+
+def test_as_of_date_is_recorded_in_the_result():
+    # A
+    row = analyze_inventory("SKU001", 1200, 80, 500, 5, as_of_date=AS_OF)
+    assert row.as_of_date == AS_OF
+    frame = analyze_inventory_frame(load_inventory(), real_demand(), as_of_date=AS_OF).frame
+    assert len(frame) == 5
+    assert (frame.as_of_date == AS_OF).all()
+
+
+def test_overdue_is_decided_by_as_of_date():
+    # B + F：同一个 expected_date，基准日不同 → 逾期结论不同；在途本数与库存位置不变
+    later = _transit_row_at(date(2026, 9, 20), "2026-09-19")
+    same_day = _transit_row_at(date(2026, 9, 19), "2026-09-19")
+
+    assert later.overdue_in_transit == 100.0    # 9-19 < 9-20 → 逾期
+    assert same_day.overdue_in_transit == 0.0   # 9-19 不算早于 9-19
+    # 逾期只增加风险信息，不改变任何供应/决策数值
+    for column in ("in_transit_stock", "inventory_position", "reorder_point", "shortage_qty", "recommended_order_qty", "status"):
+        assert later[column] == same_day[column]
+    assert later.as_of_date == date(2026, 9, 20)
+
+
+def test_core_has_no_system_clock_reads():
+    # C
+    core = (Path(__file__).resolve().parent.parent / "app" / "inventory.py").read_text(encoding="utf-8")
+    for forbidden in ("datetime.now", "date.today", "time.time"):
+        assert forbidden not in core, f"core must not read the clock: {forbidden}"
+
+
+def test_demand_basis_is_recorded():
+    # D
+    row = analyze_inventory("SKU001", 1200, 80, 500, 5, as_of_date=AS_OF)
+    assert row.demand_basis == "daily_demand_30d"
+    frame = analyze_inventory_frame(load_inventory(), real_demand(), as_of_date=AS_OF).frame
+    assert set(frame.demand_basis) == {"daily_demand_30d"}
+    assert (frame.daily_demand == frame.daily_demand_30d).all()
+
+
+def test_7d_and_trend_do_not_change_the_core_math():
+    # E
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    transit = transit_rows(("PO-1", "SKU001", 20, "2026-09-25", "OPEN"))
+    calm = demand_rows(("SKU001", 10.0, 1.0, "DECREASING", 30, 10, "OK"))
+    hot = demand_rows(("SKU001", 10.0, 99.0, "INCREASING", 30, 10, "OK"))
+    a = analyze_inventory_frame(inventory, calm, transit, AS_OF).frame.iloc[0]
+    b = analyze_inventory_frame(inventory, hot, transit, AS_OF).frame.iloc[0]
+    for column in ("daily_demand", "coverage_days", "reorder_point", "inventory_position", "shortage_qty", "recommended_order_qty", "status"):
+        assert a[column] == b[column]
+
+
+def test_reason_without_overdue_has_no_suffix():
+    # G
+    row = step4_row(50, 100)  # expected_date 2026-09-25 → 未逾期
+    assert row.overdue_in_transit == 0
+    assert row.reason == "IN_TRANSIT_COVERS_SHORTAGE"
+    assert not row.reason.endswith("_OVERDUE")
+
+
+def test_reason_flags_overdue_transit():
+    # H
+    covered = step4_row(50, 100, expected_date="2026-09-15")
+    assert covered.overdue_in_transit == 100
+    assert covered.reason == "IN_TRANSIT_COVERS_SHORTAGE_OVERDUE"
+
+    insufficient = step4_row(50, 20, expected_date="2026-09-15")
+    assert insufficient.reason == "IN_TRANSIT_INSUFFICIENT_OVERDUE"
+    assert insufficient.recommended_order_qty == 30  # 逾期不减免补货量
+
+
+def test_positive_shortage_equals_recommended_qty():
+    # I
+    row = analyze_inventory("SKU001", 50, 10, 50, 5, as_of_date=AS_OF)
+    assert row.shortage_qty == 50.0
+    assert row.recommended_order_qty == row.shortage_qty
+
+
+def test_negative_shortage_is_preserved_and_not_ordered():
+    # J
+    row = analyze_inventory("SKU001", 1200, 80, 500, 5, as_of_date=AS_OF)
+    assert row.reorder_point == 900.0
+    assert row.inventory_position == 1200.0
+    assert row.shortage_qty == -300.0  # 原始缺口保留符号
+    assert row.recommended_order_qty == 0
+
+
+def test_sku004_real_data_keeps_the_negative_gap():
+    # K
+    frame = analyze_inventory_frame(
+        load_inventory(), real_demand(), load_in_transit(), AS_OF
+    ).frame
+    row = frame[frame.sku == "SKU004"].iloc[0]
+    assert row.reorder_point == 439.17
+    assert row.inventory_position == 1400.0
+    assert row.shortage_qty == -960.83
+    assert row.recommended_order_qty == 0
+
+
+def test_unknown_history_does_not_change_the_core_math():
+    # L
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    transit = transit_rows(("PO-1", "SKU001", 20, "2026-09-25", "OPEN"))
+    complete = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    unknown = demand_rows(("SKU001", 10.0, 10.0, "STABLE", None, 10, "UNKNOWN_HISTORY"))
+    a = analyze_inventory_frame(inventory, complete, transit, AS_OF).frame.iloc[0]
+    b = analyze_inventory_frame(inventory, unknown, transit, AS_OF).frame.iloc[0]
+
+    assert b.data_quality_status == "UNKNOWN_HISTORY" and b.history_days is None
+    for column in ("daily_demand", "coverage_days", "reorder_point", "inventory_position", "shortage_qty", "recommended_order_qty", "status"):
+        assert a[column] == b[column]
+
+
+def test_missing_and_invalid_as_of_date_fail():
+    # 第九条：对缺失/非法 as_of_date 增加测试
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+
+    try:
+        analyze_frame(inventory)  # 单表入口缺 as_of_date
+    except TypeError as e:
+        assert "as_of_date" in str(e)
+    else:
+        raise AssertionError("analyze_frame must require as_of_date")
+
+    for bad in ("2026-09-20", None, 20260920):
+        try:
+            analyze_inventory_frame(inventory, demand, as_of_date=bad)
+        except TypeError as e:
+            assert "as_of_date" in str(e)
+            continue
+        raise AssertionError(f"as_of_date={bad!r} must raise TypeError")
+
+    try:
+        analyze_inventory("SKU001", 50, 10, 50, 5)
+    except TypeError as e:
+        assert "as_of_date" in str(e)
+        return
+    raise AssertionError("analyze_inventory must require as_of_date")
+
+
+# --- STEP 5b: data_warnings（证据风险层） -------------------------------
+
+EVIDENCE_COLUMNS = (
+    "daily_demand",
+    "coverage_days",
+    "reorder_point",
+    "inventory_position",
+    "shortage_qty",
+    "recommended_order_qty",
+    "status",
+)
+
+
+def _warning_batch(*, history=30, quality="OK", qty=100, expected_date="2026-09-25"):
+    """单 SKU：ROP = 10*5 + 50 = 100。"""
+    inventory = inventory_rows(("SKU001", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", history, 10, quality))
+    transit = transit_rows(("PO-1", "SKU001", qty, expected_date, "OPEN"))
+    return analyze_inventory_frame(inventory, demand, transit, AS_OF)
+
+
+def test_unknown_history_creates_warning_without_changing_core_result():
+    # 1
+    clean = _warning_batch()
+    unknown = _warning_batch(history=None, quality="UNKNOWN_HISTORY")
+
+    assert clean.data_warnings == []
+    assert [w["code"] for w in unknown.data_warnings] == ["UNKNOWN_HISTORY"]
+    assert unknown.warnings == []  # WARNING ≠ SKIP/ERROR
+    assert unknown.skipped_count == 0 and unknown.analyzed_count == 1
+
+    for column in EVIDENCE_COLUMNS:
+        assert clean.frame.iloc[0][column] == unknown.frame.iloc[0][column], column
+
+
+def test_overdue_inbound_creates_warning_without_reducing_transit_stock():
+    # 2
+    overdue = _warning_batch(qty=500, expected_date="2026-09-15")
+    row = overdue.frame.iloc[0]
+    healthy = _warning_batch(qty=500, expected_date="2026-09-25").frame.iloc[0]
+
+    assert row.in_transit_stock == 500.0     # 不因逾期被扣减
+    assert row.overdue_in_transit == 500.0   # 只标记风险
+    assert [w["code"] for w in overdue.data_warnings] == ["OVERDUE_INBOUND"]
+    for column in EVIDENCE_COLUMNS:
+        assert row[column] == healthy[column], column
+
+
+def test_unknown_history_and_overdue_can_coexist():
+    # 3
+    batch = _warning_batch(history=None, quality="UNKNOWN_HISTORY", qty=500, expected_date="2026-09-15")
+    assert [(w["sku"], w["code"]) for w in batch.data_warnings] == [
+        ("SKU001", "UNKNOWN_HISTORY"),
+        ("SKU001", "OVERDUE_INBOUND"),
+    ]
+    assert all(w["message"] for w in batch.data_warnings)  # 每条都有可读 message
+    row = batch.frame.iloc[0]
+    assert row.in_transit_stock == 500.0
+    assert row.recommended_order_qty == 0.0  # 仍按 shortage 算
+
+
+def test_missing_demand_remains_hard_error():
+    # 4：结构性输入错误保持 hard fail，绝不降级为 warning
+    inventory = inventory_rows(("SKU001", 50, 50, 5), ("SKU002", 50, 50, 5))
+    demand = demand_rows(("SKU001", 10.0, 10.0, "STABLE", 30, 10, "OK"))
+    try:
+        analyze_inventory_frame(inventory, demand, as_of_date=AS_OF)
+    except ValueError as e:
+        assert "missing demand" in str(e) and "SKU002" in str(e)
+        return
+    raise AssertionError("missing demand must stay a hard error")
+
+
+def test_data_warning_codes_are_limited_to_the_two_defined():
+    batch = _warning_batch(history=None, quality="UNKNOWN_HISTORY", qty=500, expected_date="2026-09-15")
+    codes = {w["code"] for w in batch.data_warnings}
+    assert codes == {"UNKNOWN_HISTORY", "OVERDUE_INBOUND"}
+    assert "MISSING_DEMAND" not in codes
+
+
+def test_warning_order_is_deterministic():
+    # 5
+    def collect():
+        batch = analyze_inventory_frame(load_inventory(), real_demand(), load_in_transit(), AS_OF)
+        return [(w["sku"], w["code"]) for w in batch.data_warnings], list(batch.frame.sku)
+
+    first, order = collect()
+    second, _ = collect()
+
+    assert first == second  # 可重复
+    assert order == ["SKU004", "SKU002", "SKU001", "SKU005", "SKU003"]
+    assert first == [
+        ("SKU004", "UNKNOWN_HISTORY"),
+        ("SKU002", "UNKNOWN_HISTORY"),
+        ("SKU001", "UNKNOWN_HISTORY"),
+        ("SKU001", "OVERDUE_INBOUND"),
+        ("SKU005", "UNKNOWN_HISTORY"),
+        ("SKU003", "UNKNOWN_HISTORY"),
+        ("SKU003", "OVERDUE_INBOUND"),
+    ]
+
+
+def test_warning_does_not_change_recommended_order_qty():
+    # 6：有 warning vs 无 warning，采购量完全一致
+    warned = _warning_batch(qty=20, expected_date="2026-09-15")
+    quiet = _warning_batch(qty=20, expected_date="2026-09-25")
+
+    assert [w["code"] for w in warned.data_warnings] == ["OVERDUE_INBOUND"]
+    assert quiet.data_warnings == []
+    assert warned.frame.iloc[0].shortage_qty == 30.0
+    assert warned.frame.iloc[0].recommended_order_qty == 30.0
+    assert warned.frame.iloc[0].recommended_order_qty == quiet.frame.iloc[0].recommended_order_qty
+
+
+def test_single_frame_entry_keeps_data_warnings_empty():
+    # 单表入口不做风险判定（warning 由批量入口在核心计算后生成），不会凭空产生 warning
+    frame_in = inventory_rows(("SKU001", 50, 50, 5)).assign(daily_demand=10.0)
+    batch = analyze_frame(frame_in, AS_OF)
+    assert batch.data_warnings == []
+    assert batch.analyzed_count == 1
 
 
 if __name__ == "__main__":

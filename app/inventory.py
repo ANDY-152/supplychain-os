@@ -3,7 +3,10 @@
 输入契约（STEP 4 起）：
     库存事实（inventory.csv）+ Demand Engine 输出（app/demand.py）+ 在途事实（in_transit.csv）
     `daily_demand` 一律来自 Demand Engine，**不再来自 inventory.csv**。
-    在途只参与 `inventory_position` / `recommended_order_qty`，不参与 `coverage_days` / `status`。
+    在途只参与 `inventory_position` / `shortage_qty` / `recommended_order_qty`，不参与 `coverage_days` / `status`。
+
+决策证据链（STEP 5）：每次决策必须携带基准日 `as_of_date` 与需求口径 `demand_basis`；
+原始缺口 `shortage_qty` 保留符号，`recommended_order_qty = max(0, shortage_qty)`。
 """
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import date
@@ -34,6 +37,13 @@ DEMAND_COLUMNS = tuple(c for c in _DEMAND_COLUMNS if c != "sku")
 IN_TRANSIT_FIELDS = ("po_id", "sku", "qty", "expected_date", "status")
 IN_TRANSIT_STATUSES = ("OPEN", "ARRIVED", "CANCELLED")
 
+# 需求口径（STEP 5）：当前只允许这一个；扩展时新增常量而不是靠字段相等关系猜
+DEMAND_BASIS = "daily_demand_30d"
+
+# 数据风险提示（STEP 5）：只是解释/审计信息，**绝不参与任何核心计算**
+UNKNOWN_HISTORY_WARNING = "需求历史覆盖范围无法确认，30D/7D需求值已计算，但历史完整性未知"
+OVERDUE_INBOUND_WARNING = "存在已逾期但状态仍为 OPEN 的在途数量，需要人工确认 ETA / 到货状态"
+
 
 @dataclass
 class InventoryResult:
@@ -50,6 +60,9 @@ class InventoryResult:
     overdue_in_transit: float
     inventory_position: float
     reason: str
+    shortage_qty: float
+    as_of_date: date
+    demand_basis: str
 
 
 def analyze_inventory(
@@ -60,7 +73,12 @@ def analyze_inventory(
     lead_time_days: int,
     in_transit_stock: float = 0.0,
     overdue_in_transit: float = 0.0,
+    *,
+    as_of_date: date,
 ) -> InventoryResult:
+    if not isinstance(as_of_date, date):
+        raise TypeError("as_of_date must be a datetime.date")
+
     values = {
         "current_stock": current_stock,
         "daily_demand": daily_demand,
@@ -97,10 +115,11 @@ def analyze_inventory(
     else:
         status = "NORMAL"      # 正常
 
-    # 需要采购多少：按**库存位置**算，避免已下单未到货时重复采购；不足才补，不为负
+    # 需要采购多少：只对**原始缺口**取正；由 shortage_qty 推导，绝不反向
+    shortage_qty = reorder_point - inventory_position
     recommended_order_qty = max(
         0,
-        reorder_point - inventory_position
+        shortage_qty
     )
 
     return InventoryResult(
@@ -116,38 +135,69 @@ def analyze_inventory(
         in_transit_stock=in_transit_stock,
         overdue_in_transit=overdue_in_transit,
         inventory_position=round(inventory_position, 2),
-        reason=_reason(current_stock, reorder_point, in_transit_stock, recommended_order_qty),
+        reason=_reason(
+            current_stock,
+            reorder_point,
+            in_transit_stock,
+            overdue_in_transit,
+            recommended_order_qty,
+        ),
+        shortage_qty=round(shortage_qty, 2),
+        as_of_date=as_of_date,
+        demand_basis=DEMAND_BASIS,
     )
 
 
-def _reason(current_stock: float, reorder_point: float, in_transit_stock: float, recommended_order_qty: float) -> str:
-    """短标签解释采购建议的成因（不堆砌长句）。"""
+def _reason(
+    current_stock: float,
+    reorder_point: float,
+    in_transit_stock: float,
+    overdue_in_transit: float,
+    recommended_order_qty: float,
+) -> str:
+    """短标签解释采购建议的成因（不堆砌长句）。
+
+    `overdue_in_transit > 0` 时追加 `_OVERDUE` 后缀——只增加风险可见性，
+    绝不反过来改变 in_transit_stock / inventory_position / reorder_point / 采购量。
+    """
     if recommended_order_qty > 0:
-        return "IN_TRANSIT_INSUFFICIENT" if in_transit_stock > 0 else "STOCK_BELOW_REORDER_POINT"
-    if current_stock < reorder_point and in_transit_stock > 0:
-        return "IN_TRANSIT_COVERS_SHORTAGE"
-    return "SUPPLY_SUFFICIENT"
+        base = "IN_TRANSIT_INSUFFICIENT" if in_transit_stock > 0 else "STOCK_BELOW_REORDER_POINT"
+    elif current_stock < reorder_point and in_transit_stock > 0:
+        base = "IN_TRANSIT_COVERS_SHORTAGE"
+    else:
+        base = "SUPPLY_SUFFICIENT"
+    return f"{base}_OVERDUE" if overdue_in_transit > 0 else base
 
 
 # --- thin bridge: inventory.csv -> analyze_inventory ---------------------
 
 @dataclass
 class BatchResult:
-    """Batch output: the analyzable rows plus one warning per skipped row."""
+    """Batch output: the analyzable rows plus one warning per skipped row.
+
+    `warnings`     = 导致 SKU 被跳过的结构性/数值错误（skipped_count == len(warnings)）
+    `data_warnings`= 决策已算出、但证据不完整/存在风险，需人工确认（不参与计算）
+    """
     frame: pd.DataFrame
     analyzed_count: int
     skipped_count: int
     warnings: list[dict]
+    data_warnings: list[dict]
 
 
-def analyze_frame(df: pd.DataFrame) -> BatchResult:
+def analyze_frame(df: pd.DataFrame, as_of_date: date) -> BatchResult:
     """One row per analyzable SKU, worst coverage first. Bad rows are skipped with a warning.
 
+    `as_of_date` 必填：每次决策都必须明确“哪一天”，不得读系统时间。
     在途两列为可选输入：缺列按 0（仅为单表入口兼容）。批量入口 analyze_inventory_frame()
     始终传入真实的 in_transit_stock / overdue_in_transit。
     """
+    if not isinstance(as_of_date, date):
+        raise TypeError("as_of_date must be a datetime.date")
+
     rows, warnings = [], []
     for record in _snapshot_records(df):
+        record["as_of_date"] = as_of_date
         try:
             rows.append(asdict(analyze_inventory(**record)))
         except ValueError as e:
@@ -166,6 +216,9 @@ def analyze_frame(df: pd.DataFrame) -> BatchResult:
         analyzed_count=len(rows),
         skipped_count=len(warnings),
         warnings=warnings,
+        # 单表入口没有 Demand Engine 上下文，数据风险通道留空；
+        # 批量入口 analyze_inventory_frame() 在算完之后填充。
+        data_warnings=[],
     )
 
 
@@ -182,22 +235,42 @@ def analyze_inventory_frame(
     按 sku 做显式对齐（不 drop、不 fill、不猜），对齐规则见 _aligned_snapshot()。
     demand 与在途的口径、质量结论原样传递到结果帧，不做任何改写。
 
-    in_transit_df=None 表示本次决策**未接入在途数据**（不等于“没有在途”），
-    此时 in_transit_stock = 0；传入 DataFrame 时必须同时给 as_of_date，
-    否则抛 TypeError（禁止在核心计算里读系统时间）。
+    `as_of_date` 必填（决定 overdue 判定，并写入每行决策结果）：
+    None 时抛 TypeError，**不会**退回系统时间。
+    in_transit_df=None 表示本次决策**未接入在途数据**（不等于“没有在途”）。
     """
+    if as_of_date is None:
+        raise TypeError("as_of_date is required for an inventory decision")
+
     metrics = None
     if in_transit_df is not None:
-        if as_of_date is None:
-            raise TypeError("as_of_date is required when in_transit_df is provided")
         metrics = in_transit_metrics(in_transit_df, as_of_date)
 
     aligned = _aligned_snapshot(inventory_df, demand_df, metrics)
-    batch = analyze_frame(aligned)
-    return replace(
-        batch,
-        frame=batch.frame.merge(aligned[["sku", *DEMAND_COLUMNS]], on="sku", how="left"),
-    )
+    batch = analyze_frame(aligned, as_of_date)
+    frame = batch.frame.merge(aligned[["sku", *DEMAND_COLUMNS]], on="sku", how="left")
+    # warning 在核心计算**完成之后**生成，只读结果帧，不回调公式
+    return replace(batch, frame=frame, data_warnings=_data_warnings(frame))
+
+
+def _data_warnings(frame: pd.DataFrame) -> list[dict]:
+    """从决策结果帧收集“证据风险”提示（只读，不参与任何计算）。
+
+    顺序：按决策帧的 SKU 顺序（coverage_days 升序，稳定）；同一 SKU 内
+    先 UNKNOWN_HISTORY 再 OVERDUE_INBOUND。不依赖 set 的无序结果。
+    只覆盖“已算出结果但证据有缺口”的情况；结构性输入错误仍走 hard fail。
+    """
+    collected = []
+    for row in frame.itertuples():
+        if row.data_quality_status == "UNKNOWN_HISTORY":
+            collected.append(
+                {"sku": row.sku, "code": "UNKNOWN_HISTORY", "message": UNKNOWN_HISTORY_WARNING}
+            )
+        if row.overdue_in_transit > 0:
+            collected.append(
+                {"sku": row.sku, "code": "OVERDUE_INBOUND", "message": OVERDUE_INBOUND_WARNING}
+            )
+    return collected
 
 
 def in_transit_metrics(in_transit_df: pd.DataFrame, as_of_date: date) -> pd.DataFrame:
