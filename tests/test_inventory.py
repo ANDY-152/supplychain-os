@@ -2,6 +2,8 @@
 import io
 from contextlib import redirect_stdout
 
+import pandas as pd
+
 from app import demo
 from app.data_loader import load_csv, load_inventory
 from app.inventory import analyze_frame, analyze_inventory
@@ -99,13 +101,59 @@ def test_null_values_rejected():
 
 def test_extra_columns_ignored():
     df = load_inventory().assign(supplier="Acme", unit_cost=1.5, category="A", warehouse="WH1")
-    out = analyze_frame(df)
-    assert len(out) == 5
-    assert out.iloc[0].sku == "SKU004"
+    batch = analyze_frame(df)
+    assert batch.analyzed_count == 5
+    assert batch.skipped_count == 0
+    assert batch.frame.iloc[0].sku == "SKU004"
+
+
+def test_batch_skips_bad_rows():
+    df = pd.DataFrame(
+        {
+            "sku": ["SKU001", "SKU002", "SKU003", "SKU004", "SKU005"],
+            "current_stock": [1200, 500, 5000, 200, 1500],
+            "daily_demand": [80, 100, float("nan"), 80, 50],  # SKU003 daily_demand 为空
+            "safety_stock": [500, 300, 500, 400, 400],
+            "lead_time_days": [5, 7, 10, 5, 3],
+        }
+    )
+    batch = analyze_frame(df)
+
+    assert batch.analyzed_count == 4
+    assert batch.skipped_count == 1
+    assert len(batch.warnings) == 1
+    warning = batch.warnings[0]
+    assert warning["sku"] == "SKU003"
+    assert warning["field"] == "daily_demand"
+    assert "must not be null" in warning["message"]
+
+    # 其余 4 个 SKU 仍然得到正常分析
+    assert set(batch.frame.sku) == {"SKU001", "SKU002", "SKU004", "SKU005"}
+    assert batch.frame.iloc[0].sku == "SKU004"  # 覆盖天数最低，排最前
+    assert batch.frame[batch.frame.sku == "SKU002"].recommended_order_qty.iloc[0] == 500
+
+
+def test_all_rows_bad_returns_empty_with_warnings():
+    df = pd.DataFrame(
+        {
+            "sku": ["SKU001", "SKU002"],
+            "current_stock": [1200, float("nan")],
+            "daily_demand": [float("nan"), 100],
+            "safety_stock": [500, 300],
+            "lead_time_days": [5, 7],
+        }
+    )
+    batch = analyze_frame(df)
+
+    assert batch.analyzed_count == 0
+    assert batch.skipped_count == 2
+    assert len(batch.frame) == 0
+    assert [w["sku"] for w in batch.warnings] == ["SKU001", "SKU002"]
+    assert [w["field"] for w in batch.warnings] == ["daily_demand", "current_stock"]
 
 
 def test_real_file_has_all_statuses():
-    out = analyze_frame(load_inventory())
+    out = analyze_frame(load_inventory()).frame
     assert set(out.status) == {"CRITICAL", "REORDER", "OVERSTOCK", "NORMAL"}
     assert out.iloc[0].sku == "SKU004"  # sorted by coverage, worse first
 
@@ -124,6 +172,20 @@ def test_missing_columns_rejected():
     raise AssertionError("products.csv should not pass as inventory")
 
 
+def test_format_number():
+    assert demo.format_number(600.0) == "600"
+    assert demo.format_number(500.0) == "500"
+    assert demo.format_number(5.0) == "5"
+    assert demo.format_number(2.5) == "2.5"
+    assert demo.format_number(12.75) == "12.75"
+    # 小数点后的有效数字必须保留（不能用 int() 截断）
+    assert demo.format_number(12.5) == "12.5"
+    assert demo.format_number(0) == "0"
+    # 异常值不能被静默当成 0
+    assert demo.format_number(float("nan")) != "0"
+    assert demo.format_number(None) != "0"
+
+
 def test_report():
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -131,6 +193,11 @@ def test_report():
     out = buf.getvalue()
     assert "Inventory Decision Engine" in out
     assert "SKU004" in out and "CRITICAL" in out and "建议采购量: 600" in out
+    assert "分析完成: 5 个 SKU, 跳过 0 个" in out
+    # 整数不再显示成 15.0 / 30.0
+    assert "库存覆盖天数: 15" in out
+    assert "库存覆盖天数: 30" in out
+    assert ".0\n" not in out
 
 
 if __name__ == "__main__":

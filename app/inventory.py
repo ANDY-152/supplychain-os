@@ -1,5 +1,5 @@
 """Core inventory calculations."""
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 import pandas as pd
 
@@ -76,8 +76,35 @@ def analyze_inventory(
 
 # --- thin bridge: inventory.csv -> analyze_inventory ---------------------
 
-def analyze_frame(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per SKU, worst coverage first. Extra columns are ignored."""
-    return pd.DataFrame(
-        [asdict(analyze_inventory(**r)) for r in df[list(FIELDS)].to_dict("records")]
-    ).sort_values("coverage_days")
+@dataclass
+class BatchResult:
+    """Batch output: the analyzable rows plus one warning per skipped row."""
+    frame: pd.DataFrame
+    analyzed_count: int
+    skipped_count: int
+    warnings: list[dict]
+
+
+def analyze_frame(df: pd.DataFrame) -> BatchResult:
+    """One row per analyzable SKU, worst coverage first. Bad rows are skipped with a warning."""
+    rows, warnings = [], []
+    for record in df[list(FIELDS)].to_dict("records"):
+        try:
+            rows.append(asdict(analyze_inventory(**record)))
+        except ValueError as e:
+            message = str(e)
+            warnings.append(
+                {
+                    "sku": record["sku"],
+                    "field": message.split()[0],  # analyze_inventory 的消息以字段名开头
+                    "message": message,
+                }
+            )
+
+    frame = pd.DataFrame(rows, columns=[f.name for f in fields(InventoryResult)])
+    return BatchResult(
+        frame=frame.sort_values("coverage_days"),
+        analyzed_count=len(rows),
+        skipped_count=len(warnings),
+        warnings=warnings,
+    )
