@@ -12,7 +12,7 @@ from datetime import date
 
 import pandas as pd
 
-from app.data_loader import load_in_transit, load_inventory, load_orders
+from app.data_loader import load_data_metadata, load_in_transit, load_inventory, load_orders
 from app.demand import calculate_demand
 from app.inventory import analyze_inventory_frame
 
@@ -34,7 +34,9 @@ def main(as_of_date: date | None = None):
         as_of_date = date.today()
 
     # 日均需求一律来自 Demand Engine（daily_demand_30d），不再来自 inventory.csv
-    demand = calculate_demand(load_orders(), as_of_date)
+    # 数据覆盖起点由 data_metadata.csv 声明，只负责加载与传递，不在展示层重算历史长度
+    coverage_start = load_data_metadata()
+    demand = calculate_demand(load_orders(), as_of_date, coverage_start=coverage_start)
     # STEP 6：接入 in_transit.csv，使 demo 与库存决策引擎使用完全一致的在途口径
     results = analyze_inventory_frame(
         load_inventory(),

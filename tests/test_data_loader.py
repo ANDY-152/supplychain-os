@@ -1,12 +1,15 @@
 """Run: pytest  |  python -m tests.test_data_loader  (from the repo root)"""
 import tempfile
+from datetime import date
 from pathlib import Path
 
 from app.data_loader import (
+    DATA_METADATA_COLUMNS,
     INVENTORY_COLUMNS,
     IN_TRANSIT_COLUMNS,
     ORDERS_COLUMNS,
     PRODUCTS_COLUMNS,
+    load_data_metadata,
     load_in_transit,
     load_inventory,
     load_orders,
@@ -89,6 +92,59 @@ def test_extra_columns_do_not_break_loading():
         for extra in ("supplier", "unit_cost", "warehouse"):
             assert extra in df.columns  # 额外列保留，不报错
         assert len(df) == 1
+
+
+def test_data_metadata_loads_coverage_start():
+    assert load_data_metadata() == date(2026, 8, 24)
+    assert DATA_METADATA_COLUMNS == {"key", "value"}
+
+
+def test_data_metadata_missing_key_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "meta.csv"
+        path.write_text("key,value\nas_of,2026-09-20\n", encoding="utf-8")
+        try:
+            load_data_metadata(path)
+        except ValueError as e:
+            assert "coverage_start" in str(e)
+            return
+    raise AssertionError("missing coverage_start key must raise ValueError")
+
+
+def test_data_metadata_invalid_date_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "meta.csv"
+        path.write_text("key,value\ncoverage_start,2026/08/24\n", encoding="utf-8")
+        try:
+            load_data_metadata(path)
+        except ValueError as e:
+            assert "coverage_start" in str(e)
+            return
+    raise AssertionError("invalid coverage_start must raise ValueError")
+
+
+def test_data_metadata_duplicate_key_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "meta.csv"
+        path.write_text(
+            "key,value\ncoverage_start,2026-08-24\ncoverage_start,2026-08-25\n",
+            encoding="utf-8",
+        )
+        try:
+            load_data_metadata(path)
+        except ValueError as e:
+            assert "duplicate" in str(e)
+            return
+    raise AssertionError("duplicate coverage_start must raise ValueError")
+
+
+def test_data_metadata_missing_columns_fails():
+    try:
+        load_data_metadata("inventory.csv")  # 缺 key / value
+    except ValueError as e:
+        assert "key" in str(e) or "value" in str(e)
+        return
+    raise AssertionError("inventory.csv should not pass as data_metadata")
 
 
 if __name__ == "__main__":

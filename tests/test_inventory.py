@@ -832,6 +832,41 @@ def test_unknown_history_creates_warning_without_changing_core_result():
         assert clean.frame.iloc[0][column] == unknown.frame.iloc[0][column], column
 
 
+def test_insufficient_history_creates_warning_without_changing_core_result():
+    # STEP 7：历史已知但不足 30 天 → 也必须有 warning，且不改核心结果
+    clean = _warning_batch()
+    insufficient = _warning_batch(history=10, quality="INSUFFICIENT_HISTORY")
+
+    assert clean.data_warnings == []
+    assert [w["code"] for w in insufficient.data_warnings] == ["INSUFFICIENT_HISTORY"]
+    assert insufficient.warnings == []  # WARNING ≠ SKIP/ERROR
+    assert insufficient.skipped_count == 0 and insufficient.analyzed_count == 1
+
+    for column in EVIDENCE_COLUMNS:
+        assert clean.frame.iloc[0][column] == insufficient.frame.iloc[0][column], column
+
+
+def test_quality_status_only_affects_history_warnings():
+    # OK / INSUFFICIENT_HISTORY / UNKNOWN_HISTORY 三态：只有 warning 不同，核心计算完全一致
+    ok = _warning_batch()
+    short = _warning_batch(history=10, quality="INSUFFICIENT_HISTORY")
+    unknown = _warning_batch(history=None, quality="UNKNOWN_HISTORY")
+
+    assert ok.data_warnings == []  # OK 不产生 history warning
+    assert [w["code"] for w in short.data_warnings] == ["INSUFFICIENT_HISTORY"]
+    assert [w["code"] for w in unknown.data_warnings] == ["UNKNOWN_HISTORY"]
+    # 两种质量缺口的文案必须可区分
+    assert short.data_warnings[0]["message"] != unknown.data_warnings[0]["message"]
+
+    for column in EVIDENCE_COLUMNS:
+        values = {
+            ok.frame.iloc[0][column],
+            short.frame.iloc[0][column],
+            unknown.frame.iloc[0][column],
+        }
+        assert len(values) == 1, column
+
+
 def test_overdue_inbound_creates_warning_without_reducing_transit_stock():
     # 2
     overdue = _warning_batch(qty=500, expected_date="2026-09-15")
@@ -870,10 +905,16 @@ def test_missing_demand_remains_hard_error():
     raise AssertionError("missing demand must stay a hard error")
 
 
-def test_data_warning_codes_are_limited_to_the_two_defined():
-    batch = _warning_batch(history=None, quality="UNKNOWN_HISTORY", qty=500, expected_date="2026-09-15")
-    codes = {w["code"] for w in batch.data_warnings}
-    assert codes == {"UNKNOWN_HISTORY", "OVERDUE_INBOUND"}
+def test_data_warning_codes_are_limited_to_the_defined_set():
+    codes = set()
+    for quality, history in (
+        ("OK", 30),
+        ("INSUFFICIENT_HISTORY", 10),
+        ("UNKNOWN_HISTORY", None),
+    ):
+        batch = _warning_batch(history=history, quality=quality, qty=500, expected_date="2026-09-15")
+        codes |= {w["code"] for w in batch.data_warnings}
+    assert codes == {"UNKNOWN_HISTORY", "INSUFFICIENT_HISTORY", "OVERDUE_INBOUND"}
     assert "MISSING_DEMAND" not in codes
 
 
@@ -964,7 +1005,9 @@ def test_demo_shows_core_and_evidence_values():
     assert "库存位置: 1400" in out
     assert "原始缺口: -960.83" in out
     assert "30D日均需求: 7.8333333333" in out
-    assert "数据质量: UNKNOWN_HISTORY" in out
+    # STEP 7：真实 data_metadata.csv 声明 coverage_start=2026-08-24 → 28 天 → 历史不足
+    assert "历史覆盖天数: 28" in out
+    assert "数据质量: INSUFFICIENT_HISTORY" in out
 
 
 def test_demo_separates_warnings_from_risk_warnings():
@@ -972,7 +1015,7 @@ def test_demo_separates_warnings_from_risk_warnings():
     out = _run_demo()
     assert "【硬失败 / 跳过】" in out
     assert "【风险 / 置信度提示】" in out
-    assert "UNKNOWN_HISTORY" in out
+    assert "INSUFFICIENT_HISTORY" in out
     assert "OVERDUE_INBOUND" in out
 
 

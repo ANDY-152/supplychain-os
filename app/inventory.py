@@ -42,6 +42,7 @@ DEMAND_BASIS = "daily_demand_30d"
 
 # 数据风险提示（STEP 5）：只是解释/审计信息，**绝不参与任何核心计算**
 UNKNOWN_HISTORY_WARNING = "需求历史覆盖范围无法确认，30D/7D需求值已计算，但历史完整性未知"
+INSUFFICIENT_HISTORY_WARNING = "订单历史已证明不足 30 天，30D/7D需求值已按固定分母算出，历史不完整"
 OVERDUE_INBOUND_WARNING = "存在已逾期但状态仍为 OPEN 的在途数量，需要人工确认 ETA / 到货状态"
 
 
@@ -257,7 +258,8 @@ def _data_warnings(frame: pd.DataFrame) -> list[dict]:
     """从决策结果帧收集“证据风险”提示（只读，不参与任何计算）。
 
     顺序：按决策帧的 SKU 顺序（coverage_days 升序，稳定）；同一 SKU 内
-    先 UNKNOWN_HISTORY 再 OVERDUE_INBOUND。不依赖 set 的无序结果。
+    先历史质量（UNKNOWN_HISTORY 或 INSUFFICIENT_HISTORY）再 OVERDUE_INBOUND。
+    不依赖 set 的无序结果。
     只覆盖“已算出结果但证据有缺口”的情况；结构性输入错误仍走 hard fail。
     """
     collected = []
@@ -265,6 +267,10 @@ def _data_warnings(frame: pd.DataFrame) -> list[dict]:
         if row.data_quality_status == "UNKNOWN_HISTORY":
             collected.append(
                 {"sku": row.sku, "code": "UNKNOWN_HISTORY", "message": UNKNOWN_HISTORY_WARNING}
+            )
+        elif row.data_quality_status == "INSUFFICIENT_HISTORY":
+            collected.append(
+                {"sku": row.sku, "code": "INSUFFICIENT_HISTORY", "message": INSUFFICIENT_HISTORY_WARNING}
             )
         if row.overdue_in_transit > 0:
             collected.append(

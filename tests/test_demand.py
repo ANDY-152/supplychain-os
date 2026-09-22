@@ -260,6 +260,17 @@ def test_calendar_denominator_without_coverage_start():
     assert row.data_quality_status == "UNKNOWN_HISTORY"
 
 
+def test_real_coverage_start_2026_08_24_yields_28_days_insufficient():
+    # STEP 7 真实元数据：2026-08-24 → 2026-09-20 闭区间 = 28 天 < 30 → INSUFFICIENT_HISTORY
+    # 分母仍是固定 30，不因历史不足而缩小
+    out = calculate_demand(
+        orders(("O1", d(1), "SKU001", 30)), AS_OF, coverage_start=date(2026, 8, 24)
+    ).iloc[0]
+    assert out.history_days == 28
+    assert out.data_quality_status == "INSUFFICIENT_HISTORY"
+    assert out.daily_demand_30d == 1.0  # 30 / 30，分母不变
+
+
 def test_coverage_start_after_as_of_raises():
     try:
         calculate_demand(orders(("O1", d(1), "SKU001", 30)), AS_OF, coverage_start=date(2026, 10, 1))
