@@ -34,7 +34,11 @@ def main(as_of_date: date | None = None):
 
     # 日均需求一律来自 Demand Engine（daily_demand_30d），不再来自 inventory.csv
     demand = calculate_demand(load_orders(), as_of_date)
-    results = analyze_inventory_frame(load_inventory(), demand)
+    results = analyze_inventory_frame(
+        load_inventory(),
+        demand,
+        as_of_date=as_of_date,
+    )
     print("=" * 40)
     print("SupplyChain OS")
     print("Inventory Decision Engine")
