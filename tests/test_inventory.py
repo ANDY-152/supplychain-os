@@ -355,19 +355,17 @@ def test_format_number():
 
 
 def test_report():
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        demo.main(as_of_date=AS_OF)  # 固定基准日：报告内容不依赖系统时间
-    out = buf.getvalue()
+    out = _run_demo()  # 固定基准日：报告内容不依赖系统时间
     assert "Inventory Decision Engine" in out
     assert "SKU004" in out and "CRITICAL" in out
     # 需求来自 Demand Engine 的 daily_demand_30d，不是 inventory.csv 里手填的 80
-    assert "日均需求: 7.8333333333" in out
-    assert "建议采购量: 239.17" in out
+    assert "日需求: 7.8333333333" in out
+    # STEP 6：demo 接入真实在途后，SKU004 的 1200 在途覆盖缺口，不再建议采购
+    assert "建议采购量: 239.17" not in out
     assert "分析完成: 5 个 SKU, 跳过 0 个" in out
     # 整数仍然不显示成 13.0 / 0.0
-    assert "当前库存: 1200" in out
-    assert "日均需求: 13" in out
+    assert "现货: 1200" in out
+    assert "日需求: 13" in out
     assert "建议采购量: 0" in out
     assert ".0\n" not in out
 
@@ -919,6 +917,63 @@ def test_single_frame_entry_keeps_data_warnings_empty():
     batch = analyze_frame(frame_in, AS_OF)
     assert batch.data_warnings == []
     assert batch.analyzed_count == 1
+
+
+# --- STEP 6: demo output（审计 / 证据 / 风险分层） ---------------------------
+
+def _run_demo() -> str:
+    """运行真实 demo（固定基准日），返回捕获的 stdout。"""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        demo.main(as_of_date=AS_OF)
+    return buf.getvalue()
+
+
+def test_demo_uses_real_in_transit_for_sku004():
+    # 1：接入 in_transit.csv 后，SKU004 由 1200 在途覆盖缺口 → 建议采购 0，不再是 239.17
+    out = _run_demo()
+    assert "SKU004" in out
+    assert "建议采购量: 239.17" not in out
+    assert "建议原因: IN_TRANSIT_COVERS_SHORTAGE" in out
+
+
+def test_demo_shows_audit_fields():
+    # 3 + 4 + 5：决策基准日 / 需求口径 / 建议原因必须出现在报告里
+    out = _run_demo()
+    assert "决策基准日: 2026-09-20" in out
+    assert "需求口径: daily_demand_30d" in out
+    assert "建议原因: IN_TRANSIT_COVERS_SHORTAGE" in out
+
+
+def test_sku004_full_decision_snapshot_matches_spec():
+    # 2：SKU004 完整决策快照
+    frame = analyze_inventory_frame(load_inventory(), real_demand(), load_in_transit(), AS_OF).frame
+    row = frame[frame.sku == "SKU004"].iloc[0]
+    assert row.current_stock == 200.0
+    assert row.in_transit_stock == 1200.0
+    assert row.inventory_position == 1400.0
+    assert row.reorder_point == 439.17
+    assert row.shortage_qty == -960.83
+    assert row.recommended_order_qty == 0.0
+
+
+def test_demo_shows_core_and_evidence_values():
+    # 核心决策值与需求证据都要展示，数值直接来自结果帧
+    out = _run_demo()
+    assert "在途库存: 1200" in out
+    assert "库存位置: 1400" in out
+    assert "原始缺口: -960.83" in out
+    assert "30D日均需求: 7.8333333333" in out
+    assert "数据质量: UNKNOWN_HISTORY" in out
+
+
+def test_demo_separates_warnings_from_risk_warnings():
+    # 9 + 风险通道：硬失败与风险提示分开展示，data_warnings 不算失败
+    out = _run_demo()
+    assert "【硬失败 / 跳过】" in out
+    assert "【风险 / 置信度提示】" in out
+    assert "UNKNOWN_HISTORY" in out
+    assert "OVERDUE_INBOUND" in out
 
 
 if __name__ == "__main__":
