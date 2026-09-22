@@ -8,12 +8,14 @@ from app.data_loader import (
     INVENTORY_COLUMNS,
     IN_TRANSIT_COLUMNS,
     ORDERS_COLUMNS,
+    PROCUREMENT_CONSTRAINTS_COLUMNS,
     PRODUCTS_COLUMNS,
     load_data_metadata,
     load_in_transit,
     load_inventory,
     load_orders,
     load_products,
+    load_procurement_constraints,
 )
 
 
@@ -145,6 +147,124 @@ def test_data_metadata_missing_columns_fails():
         assert "key" in str(e) or "value" in str(e)
         return
     raise AssertionError("inventory.csv should not pass as data_metadata")
+
+
+def _constraints_file(tmp, text):
+    path = Path(tmp) / "constraints.csv"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_procurement_constraints_loads():
+    df = load_procurement_constraints()
+    assert list(df.columns) == ["sku", "moq", "order_multiple"]
+    assert PROCUREMENT_CONSTRAINTS_COLUMNS == {"sku", "moq", "order_multiple"}
+    assert set(df["sku"]) == {"SKU001", "SKU002", "SKU003", "SKU004", "SKU005"}
+    assert df["moq"].notna().all() and df["order_multiple"].notna().all()
+
+
+def test_procurement_constraints_missing_file_is_identity():
+    with tempfile.TemporaryDirectory() as tmp:
+        df = load_procurement_constraints(Path(tmp) / "does_not_exist.csv")
+        assert df.empty
+
+
+def test_procurement_constraints_empty_file_is_identity():
+    with tempfile.TemporaryDirectory() as tmp:
+        empty = Path(tmp) / "empty.csv"
+        empty.write_text("", encoding="utf-8")
+        assert load_procurement_constraints(empty).empty
+        header_only = Path(tmp) / "header_only.csv"
+        header_only.write_text("sku,moq,order_multiple\n", encoding="utf-8")
+        assert load_procurement_constraints(header_only).empty
+
+
+def test_procurement_constraints_negative_moq_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _constraints_file(tmp, "sku,moq,order_multiple\nSKU001,-1,10\n")
+        try:
+            load_procurement_constraints(path)
+        except ValueError as e:
+            assert "moq" in str(e)
+            return
+    raise AssertionError("negative moq must raise ValueError")
+
+
+def test_procurement_constraints_multiple_below_one_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _constraints_file(tmp, "sku,moq,order_multiple\nSKU001,10,0\n")
+        try:
+            load_procurement_constraints(path)
+        except ValueError as e:
+            assert "order_multiple" in str(e)
+            return
+    raise AssertionError("order_multiple < 1 must raise ValueError")
+
+
+def test_procurement_constraints_non_integer_multiple_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _constraints_file(tmp, "sku,moq,order_multiple\nSKU001,10,2.5\n")
+        try:
+            load_procurement_constraints(path)
+        except ValueError as e:
+            assert "integer" in str(e)
+            return
+    raise AssertionError("non-integer order_multiple must raise ValueError")
+
+
+def test_procurement_constraints_nan_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _constraints_file(tmp, "sku,moq,order_multiple\nSKU001,,10\n")
+        try:
+            load_procurement_constraints(path)
+        except ValueError as e:
+            assert "moq" in str(e)
+            return
+    raise AssertionError("null moq must raise ValueError")
+
+
+def test_procurement_constraints_invalid_string_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _constraints_file(tmp, "sku,moq,order_multiple\nSKU001,abc,10\n")
+        try:
+            load_procurement_constraints(path)
+        except ValueError as e:
+            assert "moq" in str(e)
+            return
+    raise AssertionError("invalid string moq must raise ValueError")
+
+
+def test_procurement_constraints_duplicate_sku_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _constraints_file(
+            tmp, "sku,moq,order_multiple\nSKU001,10,2\nSKU001,20,3\n"
+        )
+        try:
+            load_procurement_constraints(path)
+        except ValueError as e:
+            assert "duplicate" in str(e)
+            return
+    raise AssertionError("duplicate constraint SKU must raise ValueError")
+
+
+def test_procurement_constraints_unknown_sku_fails():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _constraints_file(tmp, "sku,moq,order_multiple\nSKU999,10,2\n")
+        try:
+            load_procurement_constraints(path)
+        except ValueError as e:
+            assert "SKU999" in str(e)
+            return
+    raise AssertionError("unknown constraint SKU must raise ValueError")
+
+
+def test_procurement_constraints_missing_columns_fails():
+    try:
+        load_procurement_constraints("inventory.csv")  # 缺 moq / order_multiple
+    except ValueError as e:
+        assert "moq" in str(e) or "order_multiple" in str(e)
+        return
+    raise AssertionError("inventory.csv should not pass as procurement_constraints")
 
 
 if __name__ == "__main__":

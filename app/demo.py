@@ -1,20 +1,29 @@
 """Program entry point. Run: python -X utf8 -m app.demo
 
-数据流（STEP 3 起，STEP 6 起接入在途）：
+数据流（STEP 3 起，STEP 6 接入在途，STEP 8 接入 Level 2 采购建议）：
     inventory.csv（库存事实） + orders.csv（订单事实） + in_transit.csv（在途事实）
-        → app.demand.calculate_demand()   (Demand Engine)
-        → app.inventory.analyze_inventory_frame()   (库存决策)
+        + data_metadata.csv（覆盖起点） + procurement_constraints.csv（采购约束）
+        → app.demand.calculate_demand()          (Demand Engine)
+        → app.inventory.analyze_inventory_frame() (Level 1 库存决策)
+        → app.procurement.apply_procurement()     (Level 2 采购建议)
         → 打印
 本模块只负责「加载 → 调用 → 展示」，不复制任何计算。
-展示的每个数值都直接取自 results.frame，绝不在此重新计算。
+展示的每个数值都直接取自结果帧，绝不在此重新计算。
 """
 from datetime import date
 
 import pandas as pd
 
-from app.data_loader import load_data_metadata, load_in_transit, load_inventory, load_orders
+from app.data_loader import (
+    load_data_metadata,
+    load_in_transit,
+    load_inventory,
+    load_orders,
+    load_procurement_constraints,
+)
 from app.demand import calculate_demand
 from app.inventory import analyze_inventory_frame
+from app.procurement import apply_procurement
 
 
 def format_number(value) -> str:
@@ -44,7 +53,7 @@ def main(as_of_date: date | None = None):
         in_transit_df=load_in_transit(),
         as_of_date=as_of_date,
     )
-    frame = results.frame
+    frame = apply_procurement(results.frame, load_procurement_constraints())
 
     print("=" * 40)
     print("SupplyChain OS")
@@ -70,6 +79,10 @@ def main(as_of_date: date | None = None):
         print(f"  原始缺口: {format_number(row.shortage_qty)}")
         print(f"  建议采购量: {format_number(row.recommended_order_qty)}")
         print(f"  建议原因: {row.reason}")
+        # Level 2：只读展示，不在展示层重新计算
+        print(f"  采购建议量(L2): {format_number(row.procurement_recommended_qty)}")
+        print(f"  采购置信: {'暂定' if row.provisional else '正常'}")
+        print(f"  采购原因: {row.procurement_reason}")
 
     # --- 需求证据 / 置信度：只读透传，绝不进入核心公式 ---
     print("\n" + "-" * 40)

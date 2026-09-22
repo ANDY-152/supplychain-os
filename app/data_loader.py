@@ -13,6 +13,8 @@ IN_TRANSIT_COLUMNS = {"po_id", "sku", "qty", "expected_date", "status"}
 # data_metadata.csv 只声明数据覆盖的起点；不声明其他元数据
 DATA_METADATA_COLUMNS = {"key", "value"}
 COVERAGE_START_KEY = "coverage_start"
+# procurement_constraints.csv：按 SKU 的 Level 2 采购约束（moq / order_multiple）
+PROCUREMENT_CONSTRAINTS_COLUMNS = {"sku", "moq", "order_multiple"}
 
 
 def load_csv(name: str, required: set[str] = frozenset(), **read_csv_kwargs) -> pd.DataFrame:
@@ -65,3 +67,72 @@ def load_data_metadata(name: str = "data_metadata.csv", **read_csv_kwargs) -> da
         raise ValueError(
             f"invalid {COVERAGE_START_KEY} (expected YYYY-MM-DD): {raw!r}"
         ) from e
+
+
+def load_procurement_constraints(
+    name: str = "procurement_constraints.csv", **read_csv_kwargs
+) -> pd.DataFrame:
+    """procurement_constraints.csv -> 一行一个 SKU：`sku, moq, order_multiple`。
+
+    Level 2 采购约束（当前仅 SKU 维度，无 supplier）：
+    - 文件不存在 / 文件为空 / 无该 SKU 行 → “未配置”（返回空 frame），不报错；
+      Level 2 在该 SKU 上保持 identity。
+    - 文件存在但结构非法 → fail-loud（空 sku / 重复 / 未知 SKU / 负 MOQ /
+      非整数或不小于 1 的倍数 / NaN / 非法字符串）。
+
+    绝不 silently fillna，也不生成业务默认值：`moq == 0` 表示未启用 MOQ，
+    `order_multiple == 1` 表示未启用倍数。
+    """
+    path = DATA_DIR / name
+    if not path.exists() or path.stat().st_size == 0:
+        return _empty_constraints()
+
+    df = load_csv(name, required=PROCUREMENT_CONSTRAINTS_COLUMNS, **read_csv_kwargs)
+    df = df[["sku", "moq", "order_multiple"]]
+    if df.empty:
+        return _empty_constraints()
+
+    blank = df["sku"].isna() | (df["sku"].astype(str).str.strip() == "")
+    if blank.any():
+        raise ValueError(f"blank sku in procurement_constraints: {int(blank.sum())} row(s)")
+
+    duplicated = df["sku"].duplicated()
+    if duplicated.any():
+        raise ValueError(
+            f"duplicate constraint SKU: {sorted(df['sku'][duplicated].unique().tolist())}"
+        )
+
+    unknown = sorted(set(df["sku"]) - set(load_inventory()["sku"]))
+    if unknown:
+        raise ValueError(f"unknown constraint SKU: {unknown}")
+
+    try:
+        moq = pd.to_numeric(df["moq"])
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"invalid moq: {e}") from e
+    if moq.isna().any():
+        raise ValueError("null moq in procurement_constraints")
+
+    try:
+        multiple = pd.to_numeric(df["order_multiple"])
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"invalid order_multiple: {e}") from e
+    if multiple.isna().any():
+        raise ValueError("null order_multiple in procurement_constraints")
+
+    if (moq < 0).any():
+        raise ValueError(f"moq must be >= 0: {df['sku'][moq < 0].tolist()}")
+    if (multiple < 1).any():
+        raise ValueError(f"order_multiple must be >= 1: {df['sku'][multiple < 1].tolist()}")
+    if (multiple % 1 != 0).any():
+        raise ValueError(
+            f"order_multiple must be an integer: {df['sku'][multiple % 1 != 0].tolist()}"
+        )
+
+    return df.assign(
+        moq=moq.astype(float), order_multiple=multiple.astype(int)
+    ).reset_index(drop=True)
+
+
+def _empty_constraints() -> pd.DataFrame:
+    return pd.DataFrame(columns=["sku", "moq", "order_multiple"])

@@ -1019,6 +1019,15 @@ def test_demo_separates_warnings_from_risk_warnings():
     assert "OVERDUE_INBOUND" in out
 
 
+def test_demo_shows_level2_procurement_fields():
+    # STEP 8：Level 1 输出保留，同时展示 Level 2 三字段
+    out = _run_demo()
+    assert "建议采购量: 0" in out            # Level 1 仍在
+    assert "采购建议量(L2): 0" in out
+    assert "采购置信:" in out
+    assert "采购原因: NO_GAP" in out          # 真实数据 gap=0 → 无采购缺口
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
