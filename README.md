@@ -1,40 +1,30 @@
+[中文](./README.md) | [English](./README_EN.md)
+
 # Supply Chain Decision Agent
 
-A deterministic supply-chain decision engine for **inventory replenishment** and
-**procurement recommendations**.
+一个面向**库存补货**与**采购建议**的确定性供应链决策引擎。
 
-It turns raw order, inventory and in-transit facts into an auditable decision
-per SKU: how much demand is there, where the stock position sits, whether a
-replenishment gap exists, and what quantity should be ordered after MOQ / order
-multiple constraints. Every result carries its evidence and its data-quality
-status, and can be replayed day by day with a multi-day simulator.
+它把原始的订单、库存与在途事实，转化为每个 SKU 的一条可审计决策：需求有多少、库存位置在哪里、是否存在补货缺口，以及在 MOQ / 订货倍数约束之后应该下多少量。每条结果都携带其证据与数据质量状态，并可通过多日仿真逐日复现。
 
-> Scope note: "Agent" here refers to the tool-facing decision component — a
-> callable report tool plus a thin Web UI wrapper. This repository does **not**
-> implement autonomous planning, multi-agent orchestration, or LLM-based
-> decision making. All decisions come from explicit, deterministic formulas.
+> 范围说明：这里的 “Agent” 指面向工具的决策组件 —— 一个可被调用的报告工具，加一层轻量 Web UI 封装。本仓库**不**实现自主规划、多 Agent 编排或基于 LLM 的决策。所有决策都来自明确、确定性的公式。
 
 ---
 
-## Overview / 项目简介
+## 项目简介
 
-The engine is a small, dependency-light Python package (pandas only, no
-database, no web framework) built around a single idea: **facts in, auditable
-decisions out**.
+该引擎是一个小而依赖极轻的 Python 包（仅 pandas；无数据库、无 Web 框架），围绕一个核心理念构建：**输入事实，输出可审计的决策**。
 
-- Inputs are plain CSV facts: orders, inventory, in-transit purchase orders,
-  coverage metadata and per-SKU procurement constraints.
-- Outputs are per-SKU decision frames with both the decision and its evidence.
-- Every calculation is anchored to an explicit `as_of_date`; the core never
-  reads the system clock, so the same inputs always produce the same outputs.
-- Bad or ambiguous data fails loudly instead of being silently "fixed".
+- 输入是纯 CSV 事实：订单、库存、在途采购订单、覆盖元数据，以及每个 SKU 的采购约束。
+- 输出是每个 SKU 的决策帧，同时包含决策与其证据。
+- 每次计算都锚定到一个显式的 `as_of_date`；核心从不读取系统时钟，因此相同输入永远产生相同输出。
+- 脏数据或含义不清的数据会大声失败，而不是被静默“修复”。
 
 ---
 
-## Core Architecture
+## 核心架构
 
 ```
-        CSV facts (data/)
+        CSV 事实 (data/)
   ┌───────────────────────────────────────────────────────────────┐
   │ inventory.csv   orders.csv   in_transit.csv                   │
   │ data_metadata.csv   procurement_constraints.csv               │
@@ -44,149 +34,129 @@ decisions out**.
                     app/data_loader.py
                               │
                               ▼
-                    app/demand.py            Demand Engine
+                    app/demand.py            需求引擎
                     daily_demand_30d / daily_demand_7d
                     demand_trend / data_quality_status
                               │
                               ▼
-                    app/inventory.py         Inventory Decision — Level 1
+                    app/inventory.py         库存决策 —— Level 1
                     reorder_point / inventory_position / shortage_qty
-                    recommended_order_qty / status / in-transit aggregation
+                    recommended_order_qty / status / 在途聚合
                               │
                               ▼
-                    app/procurement.py       Procurement Recommendation — Level 2
-                    MOQ + order multiple -> procurement_recommended_qty
+                    app/procurement.py       采购建议 —— Level 2
+                    MOQ + 订货倍数 -> procurement_recommended_qty
                               │
                               ▼
-                    app/demo.py              CLI report (stdout)
+                    app/demo.py              CLI 报告 (stdout)
                               │
-                              └──► Web UI integration (shell out + display only,
-                                   no business computation)
+                              └──► Web UI 集成（仅 shell 调用 + 展示，
+                                   不承担任何业务计算）
 ```
 
-**Separation of concerns:** each layer takes the previous layer's output as a
-plain input and adds its own conclusions. No layer reaches back to rewrite an
-earlier layer's numbers.
+**职责分离：** 每一层把上一层的输出当作普通输入，只追加自己的结论。任何层都不会反过来改写更早层的数字。
 
 ---
 
-## Core Capabilities
+## 核心能力
 
-- **Demand Engine** — trailing 30-day / 7-day average daily demand, demand
-  trend, and data-quality status.
-- **Inventory Decision (Level 1)** — coverage days, reorder point, inventory
-  position, signed shortage, non-negative replenishment quantity, and status.
-- **Procurement Recommendation (Level 2)** — applies MOQ and order multiple to
-  the Level 1 gap and reports a final recommended order quantity.
-- **In-transit handling** — only `OPEN` purchase orders count toward supply;
-  overdue `OPEN` orders are surfaced as risk without being auto-removed.
-- **Data Quality** — `OK` / `INSUFFICIENT_HISTORY` / `UNKNOWN_HISTORY` plus
-  structured risk warnings; quality never silently changes core quantities.
-- **Multi-day Simulator** — deterministic day-by-day state progression reusing
-  the same demand / inventory / procurement logic.
-- **Audit Log** — append-only JSONL records of decisions that were actually
-  produced, with no recomputation.
+- **需求引擎（Demand Engine）** —— 滚动 30 天 / 7 天日均需求、需求趋势与数据质量状态。
+- **库存决策（Inventory Decision，Level 1）** —— 覆盖天数、再订货点、库存位置、带符号缺口、非负补货量，以及状态。
+- **采购建议（Procurement Recommendation，Level 2）** —— 对 Level 1 缺口施加 MOQ 与订货倍数，给出最终建议采购量。
+- **在途处理（In-transit handling）** —— 仅 `OPEN` 采购订单计入供给；逾期 `OPEN` 订单作为风险暴露，但不会被自动移除。
+- **数据质量（Data Quality）** —— `OK` / `INSUFFICIENT_HISTORY` / `UNKNOWN_HISTORY`，外加结构化风险提示；数据质量永远不会静默改变核心数量。
+- **多日仿真器（Multi-day Simulator）** —— 确定性的逐日状态推进，复用同一套需求 / 库存 / 采购逻辑。
+- **审计日志（Audit Log）** —— 以 JSONL 追加记录真正产生过的决策，不做任何重算。
 
 ---
 
-## Demand Engine
+## 需求引擎（Demand Engine）
 
-`app/demand.py` exposes a pure function:
+`app/demand.py` 提供一个纯函数：
 
 ```python
 calculate_demand(orders, as_of_date, coverage_start=None) -> pd.DataFrame
 ```
 
-Output columns: `sku`, `daily_demand_30d`, `daily_demand_7d`, `demand_trend`,
-`history_days`, `order_active_days`, `data_quality_status`.
+输出列：`sku`、`daily_demand_30d`、`daily_demand_7d`、`demand_trend`、`history_days`、`order_active_days`、`data_quality_status`。
 
-**30D / 7D windows** (closed intervals, calendar days, fixed denominators):
+**30D / 7D 窗口**（闭区间、自然日、固定分母）：
 
 ```
 daily_demand_30d = sum(qty in [as_of_date - 29, as_of_date]) / 30
 daily_demand_7d  = sum(qty in [as_of_date - 6,  as_of_date]) / 7
 ```
 
-- A day with no orders counts as `0` demand; the denominator stays 30 / 7.
-- Orders dated after `as_of_date` are excluded from every window.
+- 某天没有订单按 `0` 需求计；分母始终是 30 / 7。
+- 晚于 `as_of_date` 的订单不进入任何窗口。
 
-**Trend** (strict comparisons, so the exact boundaries are `STABLE`):
-
-```
-INCREASING   when daily_demand_7d >  daily_demand_30d * 1.10
-DECREASING   when daily_demand_7d <  daily_demand_30d * 0.90
-NO_DEMAND    when daily_demand_30d == 0 and daily_demand_7d == 0
-otherwise STABLE
-```
-
-**History / quality** are about data coverage, not about order activity. They
-are only asserted when coverage can be proven:
+**趋势**（严格不等号，因此恰好落在边界上是 `STABLE`）：
 
 ```
-history_days = (as_of_date - coverage_start).days + 1   # when coverage_start is given
-coverage_start is None            -> UNKNOWN_HISTORY
-history_days < 30                 -> INSUFFICIENT_HISTORY
-otherwise                         -> OK
+INCREASING   当 daily_demand_7d >  daily_demand_30d * 1.10
+DECREASING   当 daily_demand_7d <  daily_demand_30d * 0.90
+NO_DEMAND    当 daily_demand_30d == 0 且 daily_demand_7d == 0
+其余情况     STABLE
 ```
 
-The engine fails loudly on null, non-numeric, negative, or malformed inputs
-rather than coercing them.
+**历史 / 质量**描述的是数据覆盖范围，而不是订单活跃程度。只有在覆盖范围可被证明时才下结论：
+
+```
+history_days = (as_of_date - coverage_start).days + 1   # 提供 coverage_start 时
+未提供 coverage_start    -> UNKNOWN_HISTORY
+history_days < 30        -> INSUFFICIENT_HISTORY
+其余情况                  -> OK
+```
+
+引擎对空值、非数值、负数或格式错误的输入会大声失败，而不是强行转换。
 
 ---
 
-## Inventory Decision Level 1
+## 库存决策 Level 1（Inventory Decision Level 1）
 
-`app/inventory.py` blends inventory facts with the Demand Engine output and
-in-transit facts. The daily demand used here is the Demand Engine's
-`daily_demand_30d` (`demand_basis = "daily_demand_30d"`).
+`app/inventory.py` 把库存事实、需求引擎输出与在途事实装配在一起。这里使用的日需求是需求引擎的 `daily_demand_30d`（`demand_basis = "daily_demand_30d"`）。
 
-**Core formulas:**
+**核心公式：**
 
 ```
 coverage_days         = current_stock / daily_demand
 reorder_point         = daily_demand * lead_time_days + safety_stock
-inventory_position    = current_stock + in_transit_stock        # OPEN in-transit only
-shortage_qty          = reorder_point - inventory_position      # signed
+inventory_position    = current_stock + in_transit_stock        # 仅 OPEN 在途
+shortage_qty          = reorder_point - inventory_position      # 带符号
 recommended_order_qty = max(0, shortage_qty)                    # Level 1
 ```
 
-**Status** is decided from on-hand stock only (in-transit does not change the
-status):
+**状态**只由现货决定（在途不影响状态）：
 
 ```
 CRITICAL   current_stock < safety_stock
 REORDER    current_stock < reorder_point
 OVERSTOCK  coverage_days > 180
-NORMAL     otherwise
+NORMAL     其余情况
 ```
 
-**In-transit rules:**
+**在途规则：**
 
-- Only `status == "OPEN"` counts toward `in_transit_stock`.
-- `ARRIVED` and `CANCELLED` are excluded.
-- An `OPEN` order whose `expected_date < as_of_date` still counts, and is also
-  reported in `overdue_in_transit` (a **subset**, risk information only — it is
-  never subtracted from the position).
-- `coverage_days` uses on-hand stock only; in-transit is not in that numerator.
+- 只有 `status == "OPEN"` 计入 `in_transit_stock`。
+- `ARRIVED` 与 `CANCELLED` 不计入。
+- `OPEN` 且 `expected_date < as_of_date` 的订单仍然计入，同时上报到 `overdue_in_transit`（这是**子集**，仅为风险信息 —— 绝不会从库存位置中扣减）。
+- `coverage_days` 只用现货计算；在途不进入该分子。
 
-Each decision also carries an explicit `reason` code (e.g.
-`STOCK_BELOW_REORDER_POINT`, `IN_TRANSIT_COVERS_SHORTAGE`,
-`SUPPLY_SUFFICIENT`, with an optional `_OVERDUE` suffix).
+每条决策还携带一个明确的 `reason` 代码（例如 `STOCK_BELOW_REORDER_POINT`、`IN_TRANSIT_COVERS_SHORTAGE`、`SUPPLY_SUFFICIENT`，可带 `_OVERDUE` 后缀）。
 
 ---
 
-## Procurement Recommendation Level 2
+## 采购建议 Level 2（Procurement Recommendation Level 2）
 
-`app/procurement.py` consumes the Level 1 result frame and per-SKU constraints
-(`moq`, `order_multiple`) and appends exactly three columns:
+`app/procurement.py` 消费 Level 1 结果帧与每个 SKU 的约束（`moq`、`order_multiple`），并只追加三列：
 
 ```
-procurement_recommended_qty   # final recommended order quantity
-provisional                   # confidence flag (does not change the quantity)
-procurement_reason            # which constraint actually changed the quantity
+procurement_recommended_qty   # 最终建议采购量
+provisional                   # 置信标记（不改变数量）
+procurement_reason            # 实际改变了数量的约束
 ```
 
-**Constraint chain** (only ever applied to the Level 1 gap):
+**约束链**（只作用于 Level 1 的缺口）：
 
 ```
 gap = recommended_order_qty
@@ -194,149 +164,122 @@ gap = recommended_order_qty
 if gap <= 0:                         q = 0
 else:
     q = gap
-    if moq > 0 and moq > q:          q = moq            # MOQ floor
+    if moq > 0 and moq > q:          q = moq            # MOQ 下限
     if order_multiple > 1:           q = ceil(q / order_multiple) * order_multiple
 
 procurement_recommended_qty = q
 provisional = data_quality_status != "OK"
 ```
 
-`procurement_reason` is one of `NO_GAP`, `GAP_ONLY`, `MOQ_APPLIED`,
-`MULTIPLE_APPLIED`, `MOQ_AND_MULTIPLE_APPLIED`, and only reflects constraints
-that actually changed the final quantity.
+`procurement_reason` 取值为 `NO_GAP`、`GAP_ONLY`、`MOQ_APPLIED`、`MULTIPLE_APPLIED`、`MOQ_AND_MULTIPLE_APPLIED` 之一，且只反映真正改变了最终数量的约束。
 
-**Level 1 vs Level 2 — these are not the same number:**
+**Level 1 与 Level 2 不是同一个数字：**
 
-| Layer | Field | Meaning |
+| 层级 | 字段 | 含义 |
 |---|---|---|
-| Level 1 | `recommended_order_qty` | Non-negative **replenishment gap** derived from stock and demand. |
-| Level 2 | `procurement_recommended_qty` | **Procurement recommendation** after applying MOQ and order multiple. |
+| Level 1 | `recommended_order_qty` | 由库存与需求导出的非负**补货缺口**。 |
+| Level 2 | `procurement_recommended_qty` | 施加 MOQ 与订货倍数之后的**采购建议数量**。 |
 
-Level 1 is never rewritten by Level 2; both are kept side by side so the
-rounding decision stays auditable.
+Level 1 永远不会被 Level 2 改写；两者并排保留，使取整决策保持可审计。
 
 ---
 
-## Data Quality
+## 数据质量（Data Quality）
 
-The Demand Engine returns a data-quality status:
+需求引擎返回一个数据质量状态：
 
-| Status | Meaning |
+| 状态 | 含义 |
 |---|---|
-| `OK` | Coverage of at least 30 days is provable from `coverage_start`. |
-| `INSUFFICIENT_HISTORY` | Coverage is known but shorter than 30 days. |
-| `UNKNOWN_HISTORY` | No coverage start was provided; history length cannot be asserted. |
+| `OK` | 可从 `coverage_start` 证明覆盖至少 30 天。 |
+| `INSUFFICIENT_HISTORY` | 覆盖范围已知，但不足 30 天。 |
+| `UNKNOWN_HISTORY` | 未提供覆盖起点；历史长度无法断言。 |
 
-A quantity computed over an incomplete window is still produced with the fixed
-30-day denominator — the risk is exposed through the status, not by shrinking
-the denominator or guessing a start date.
+在不完整窗口上算出的数量仍会以固定 30 天分母产出 —— 风险通过状态暴露，而不是缩短分母或猜测起始日。
 
-The inventory layer additionally emits structured `data_warnings` (each with a
-`sku`, `code`, and human-readable `message`):
+库存层还会额外发出结构化 `data_warnings`（每条含 `sku`、`code` 与可读 `message`）：
 
-- `UNKNOWN_HISTORY`, `INSUFFICIENT_HISTORY` — evidence gaps.
-- `OVERDUE_INBOUND` — an overdue but still `OPEN` in-transit order.
+- `UNKNOWN_HISTORY`、`INSUFFICIENT_HISTORY` —— 证据缺口。
+- `OVERDUE_INBOUND` —— 已逾期但仍为 `OPEN` 的在途订单。
 
-**Data quality never silently changes core quantities.** It affects the warning
-channel and the Level 2 `provisional` flag only.
+**数据质量永远不会静默改变核心数量。** 它只影响提示通道以及 Level 2 的 `provisional` 标记。
 
 ---
 
-## Multi-day Simulator
+## 多日仿真器（Multi-day Simulator）
 
-`app/simulator.py` replays the engine across multiple days. It **reuses the
-existing demand / inventory / procurement modules directly** and does not
-re-implement any formula.
+`app/simulator.py` 将引擎在多个自然日上回放。它**直接复用现有的需求 / 库存 / 采购模块**，不重新实现任何公式。
 
-Daily order of operations (fixed):
+每日执行顺序（固定）：
 
 ```
-1. Receive arrivals: OPEN POs with expected_date <= current_day -> ARRIVED,
-   and their qty is added to current_stock
-2. Apply the day's demand: current_stock -= demand_qty
-3. calculate_demand()            (Demand Engine)
-4. analyze_inventory_frame()     (Inventory Level 1)
-5. apply_procurement()           (Procurement Level 2)
+1. 到货：expected_date <= current_day 的 OPEN PO -> ARRIVED，
+   数量计入 current_stock
+2. 应用当天需求：current_stock -= demand_qty
+3. calculate_demand()            (需求引擎)
+4. analyze_inventory_frame()     (库存 Level 1)
+5. apply_procurement()           (采购 Level 2)
 6. order_placed_qty = procurement_recommended_qty
-7. Create new OPEN POs: expected_date = current_day + lead_time_days
-8. Emit audit records (DECISION + SKIP)
-9. Advance to the next day
+7. 创建新的 OPEN PO：expected_date = current_day + lead_time_days
+8. 产出审计记录（DECISION + SKIP）
+9. 进入下一天
 ```
 
-Key properties:
+关键性质：
 
-- **Arrivals precede ordering**, so a purchase order created on a given day can
-  never arrive on that same day — even when `lead_time_days == 0`.
-- **Demand is applied literally**: `stock_after = stock_before - demand_qty`;
-  stock may go negative, and unmet demand is recorded as
-  `max(0, demand_qty - stock_before)`. It is never clamped to zero.
-- **`provisional=True` does not block ordering.** The quantity is still placed.
-- **`po_id` is deterministic** (`PO-{run_id}-{seq:06d}`) and unique within a run.
-- **Same inputs produce the same run.** Given the same `run_id`, `start_day`,
-  `days`, state and `demand_profile`, `run_simulation()` returns identical
-  results — there is no randomness and no clock dependency.
+- **到货先于下单**，因此某天创建的采购订单绝不会在同一天到货 —— 即使 `lead_time_days == 0` 也不会。
+- **需求按字面扣减**：`stock_after = stock_before - demand_qty`；库存允许为负，未满足需求记为 `max(0, demand_qty - stock_before)`，绝不 clamp 到零。
+- **`provisional=True` 不会阻止下单。** 数量照常生成。
+- **`po_id` 是确定性的**（`PO-{run_id}-{seq:06d}`），并在一次运行内唯一。
+- **相同输入产生相同运行。** 给定相同的 `run_id`、`start_day`、`days`、状态与 `demand_profile`，`run_simulation()` 返回完全一致的结果 —— 无随机性、无时钟依赖。
 
-**Demand separation (important):**
+**需求分离（重要）：**
 
-- `orders_log` is the **historical order log**. It is read-only and is used
-  *only* by the Demand Engine.
-- `demand_profile` is a `DataFrame[sku, simulation_day, qty]` used *only* for
-  the day's stock consumption.
-- Simulated demand is **never written back** into `orders_log`.
+- `orders_log` 是**历史订单日志**。它是只读的，且*仅*供需求引擎使用。
+- `demand_profile` 是 `DataFrame[sku, simulation_day, qty]`，*仅*用于当天库存消耗。
+- 模拟需求**绝不会写回** `orders_log`。
 
-**Zero-demand SKUs:** if a SKU has no demand evidence and the inventory layer
-skips it for a day, the simulator does not delete the SKU. It records a `SKIP`
-audit entry (keeping the original warning field/message), places no order for
-it, and carries the SKU into the next day.
+**零需求 SKU：** 如果某个 SKU 没有需求证据、被库存层在当天跳过，仿真器不会删除该 SKU。它会记录一条 `SKIP` 审计条目（保留原 warning 的 field/message），不为它下单，并将该 SKU 带入下一天。
 
 ---
 
-## Audit Log
+## 审计日志（Audit Log）
 
-`app/audit_log.py` provides two small functions:
+`app/audit_log.py` 提供两个小函数：
 
 ```python
 build_audit_records(frame, action=None) -> list[dict]
 append_audit_records(path, records) -> None
 ```
 
-- `build_audit_records` **projects** the decision frame into records and merges
-  the simulator's action fields (`order_placed_qty`, `po_id`, `expected_date`).
-  It does not recompute any business value.
-- `append_audit_records` writes **JSONL** in append mode, UTF-8,
-  `ensure_ascii=False`, one JSON object per line. It never overwrites and never
-  swallows write failures.
+- `build_audit_records` **投影**决策帧为记录，并合并仿真器的动作字段（`order_placed_qty`、`po_id`、`expected_date`）。它不重算任何业务值。
+- `append_audit_records` 以**追加**模式写 **JSONL**，UTF-8、`ensure_ascii=False`、一行一个 JSON object。它绝不覆盖，也绝不吞掉写入失败。
 
-Record envelope: `run_id`, `simulation_day`, `as_of_date`, `sku`,
-`record_type` (`DECISION` or `SKIP`). DECISION records additionally carry the
-projected Level 1 / Level 2 / demand-evidence fields.
+记录信封：`run_id`、`simulation_day`、`as_of_date`、`sku`、`record_type`（`DECISION` 或 `SKIP`）。DECISION 记录还会携带投影后的 Level 1 / Level 2 / 需求证据字段。
 
-The audit log **only records decisions that were already produced** — it is a
-projection/persistence layer, not a calculation layer. It does not read the
-clock and adds no timestamp.
+审计日志**只记录已经产生的决策** —— 它是投影/持久化层，而不是计算层。它不读取时钟，也不添加 timestamp。
 
 ---
 
-## Project Structure
+## 项目结构
 
 ```
 supplychain-os/
 ├── app/
 │   ├── __init__.py
-│   ├── data_loader.py    # CSV loading and contract validation
-│   ├── demand.py         # Demand Engine (30D / 7D, trend, quality)
-│   ├── inventory.py      # Inventory Decision Level 1 + in-transit aggregation
-│   ├── procurement.py    # Procurement Recommendation Level 2 (MOQ / multiple)
-│   ├── audit_log.py      # JSONL audit projection (no recomputation)
-│   ├── simulator.py      # Multi-day simulator (reuses the layers above)
-│   └── demo.py           # CLI entry point: load -> compute -> print
+│   ├── data_loader.py    # CSV 加载与契约校验
+│   ├── demand.py         # 需求引擎（30D / 7D、趋势、质量）
+│   ├── inventory.py      # 库存决策 Level 1 + 在途聚合
+│   ├── procurement.py    # 采购建议 Level 2（MOQ / 倍数）
+│   ├── audit_log.py      # JSONL 审计投影（不重算）
+│   ├── simulator.py      # 多日仿真器（复用以上各层）
+│   └── demo.py           # CLI 入口：加载 -> 计算 -> 打印
 ├── data/
 │   ├── inventory.csv
 │   ├── orders.csv
 │   ├── in_transit.csv
 │   ├── products.csv
-│   ├── data_metadata.csv            # declares coverage_start
-│   └── procurement_constraints.csv  # per-SKU moq / order_multiple
+│   ├── data_metadata.csv            # 声明 coverage_start
+│   └── procurement_constraints.csv  # 每 SKU 的 moq / order_multiple
 ├── tests/
 │   ├── test_data_loader.py
 │   ├── test_demand.py
@@ -350,7 +293,7 @@ supplychain-os/
 
 ---
 
-## Quick Start
+## 快速开始（Quick Start）
 
 ```bash
 git clone <your-repo-url> supplychain-os
@@ -365,119 +308,95 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Runtime dependency: `pandas`. There is no database, no web framework, and no
-LLM dependency in the core engine.
+运行时依赖：`pandas`。核心引擎没有数据库、没有 Web 框架、也没有 LLM 依赖。
 
 ---
 
-## Run Demo
+## 运行 Demo（Run Demo）
 
-Run the engine against the bundled sample data:
+用仓库内置样例数据运行引擎：
 
 ```bash
 python -X utf8 -m app.demo
 ```
 
-The demo loads the CSVs, runs the full pipeline, and prints a decision report to
-stdout — including the as-of date, the demand basis, per-SKU Level 1 / Level 2
-decisions, demand evidence, risk warnings, and a summary. By default it uses
-today's date; passing an explicit `as_of_date` (as the tests do) makes the
-output fully reproducible.
+Demo 会加载 CSV、运行完整链路，并把决策报告打印到 stdout —— 包括基准日、需求口径、每个 SKU 的 Level 1 / Level 2 决策、需求证据、风险提示与汇总。默认使用当天日期；传入显式 `as_of_date`（测试即如此）可让输出完全可复现。
 
-The demo is a display entry point only — it contains no business formulas of
-its own.
+Demo 只是展示入口 —— 它自身不包含任何业务公式。
 
 ---
 
-## Run Tests
+## 运行测试（Run Tests）
 
 ```bash
 pip install -r dev-requirements.txt
 python -m pytest -q
 ```
 
-Current suite: **218 passed**.
+当前测试套件：**218 passed**。
 
-The tests cover demand windows and trend boundaries, Level 1 math and status
-rules, in-transit aggregation, Level 2 constraint chains, fail-fast input
-validation, the audit-log projection and JSONL behavior, and simulator
-determinism / arrival ordering / stock conservation.
+测试覆盖需求窗口与趋势边界、Level 1 数学与状态规则、在途聚合、Level 2 约束链、输入 fail-fast 校验、审计日志投影与 JSONL 行为，以及仿真器的确定性 / 到货顺序 / 库存守恒。
 
 ---
 
 ## Web UI
 
-The engine is UI-agnostic: everything relevant is printed as deterministic
-plain text by `python -X utf8 -m app.demo`.
+引擎与 UI 无关：所有相关内容都由 `python -X utf8 -m app.demo` 以确定性纯文本打印。
 
-A Web UI integration (a Pi Web UI plugin) can wrap this entry point:
+一个 Web UI 集成（Pi Web UI 插件）可以封装这个入口：
 
-- the server side shells out to the engine and returns its stdout;
-- the client side only parses, sorts and searches the returned text.
+- 服务端 shell 调用引擎并返回其 stdout；
+- 客户端只对返回文本做解析、排序与搜索。
 
-**The Web UI does not perform any core business calculation.** It does not
-import the engine's formulas or re-derive any quantity. The plugin is a separate
-component and is not part of this repository.
+**Web UI 不承担任何核心业务计算。** 它不 import 引擎公式，也不重新推导任何数量。该插件是独立组件，不属于本仓库。
 
 ---
 
-## Design Principles
+## 设计原则
 
-- **One source of truth per formula.** Demand, inventory and procurement rules
-  live in exactly one module each; every other layer calls them.
-- **Facts and conclusions are layered.** Demand evidence, Level 1 gap, and
-  Level 2 recommendation are separate fields that never overwrite each other.
-- **Determinism by construction.** `as_of_date` is always explicit; the core
-  does not read the system clock, so results are reproducible.
-- **Fail loudly.** Nulls, negative quantities, malformed dates, duplicate keys,
-  and unknown statuses raise errors instead of being silently coerced.
-- **Quality is visible, not corrective.** Incomplete history is surfaced through
-  status and warnings; it never silently changes a quantity.
-- **The simulator reuses the engine.** It advances state and orchestrates the
-  existing modules rather than reimplementing them.
-- **The audit log records, it does not decide.** It projects already-produced
-  decisions and never recalculates them.
+- **每个公式只有一个来源。** 需求、库存、采购规则各自只存在于一个模块中；其余各层都调用它们。
+- **事实与结论分层。** 需求证据、Level 1 缺口、Level 2 建议是彼此独立的字段，绝不互相覆盖。
+- **构造上即确定性。** `as_of_date` 始终显式传入；核心不读取系统时钟，因此结果可复现。
+- **大声失败。** 空值、负数量、畸形日期、重复键与未知状态都会抛错，而不是被静默转换。
+- **质量是可见的，而不是纠正性的。** 不完整历史通过状态与提示暴露；它绝不静默改变数量。
+- **仿真器复用引擎。** 它推进状态并编排现有模块，而不是重新实现它们。
+- **审计日志只记录，不决策。** 它投影已经产生的决策，绝不重算。
 
 ---
 
-## Current Status
+## 当前状态（Current Status）
 
-Implemented and tested:
+已实现并通过测试：
 
-- Demand Engine (30D / 7D demand, trend, coverage quality).
-- Inventory Decision Level 1 (ROP, position, shortage, replenishment quantity,
-  status).
-- In-transit handling (OPEN-only supply, overdue as risk).
-- Procurement Recommendation Level 2 (MOQ and order multiple).
-- Data-quality status and structured risk warnings.
-- Multi-day deterministic Simulator.
-- Audit Log (append-only JSONL projection).
+- 需求引擎（30D / 7D 需求、趋势、覆盖质量）。
+- 库存决策 Level 1（再订货点、库存位置、缺口、补货量、状态）。
+- 在途处理（仅 OPEN 计入供给，逾期作为风险）。
+- 采购建议 Level 2（MOQ 与订货倍数）。
+- 数据质量状态与结构化风险提示。
+- 确定性的多日仿真器。
+- 审计日志（追加式 JSONL 投影）。
 
-Test suite: **218 passed**.
-
----
-
-## Roadmap
-
-The following are **planned / future** and are **not** implemented yet:
-
-- A `LICENSE` file (see below) — *planned*.
-- Packaging metadata (e.g. `pyproject.toml`) for `pip install` — *planned*.
-- A minimal CLI wrapper around the simulator — *planned*.
-- Supplier-level attributes and lead-time variability — *planned*.
-- Additional demand policies / configurable windows — *planned*.
-- Scenario tooling for larger datasets — *planned*.
+测试套件：**218 passed**。
 
 ---
 
-## License
+## 路线图（Roadmap）
 
-This repository does **not** currently include a `LICENSE` file. Until one is
-added, the code is provided as-is without an explicit grant of reuse rights.
-Adding an OSI-approved license is a planned item (see Roadmap).
+以下均为 **planned / 未来**，**尚未实现**：
+
+- `LICENSE` 文件（见下）—— *planned*。
+- 打包元数据（如 `pyproject.toml`），支持 `pip install` —— *planned*。
+- 面向仿真器的最小 CLI 封装 —— *planned*。
+- 供应商维度属性与交期波动 —— *planned*。
+- 更多需求策略 / 可配置窗口 —— *planned*。
+- 面向更大数据集的情景工具 —— *planned*。
 
 ---
 
-**Supply Chain Decision Agent** — a deterministic decision engine for
-inventory replenishment and procurement recommendations. Decision support, not
-an automated purchasing system.
+## 许可证（License）
+
+本仓库目前**未包含** `LICENSE` 文件。在添加之前，代码按现状提供，不授予明确的再使用权利。添加一个 OSI 认可的开源许可证属于 planned 事项（见路线图）。
+
+---
+
+**Supply Chain Decision Agent** —— 一个面向库存补货与采购建议的确定性决策引擎。决策辅助，而非自动采购系统。
