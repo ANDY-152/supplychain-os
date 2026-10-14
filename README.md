@@ -7,6 +7,8 @@
 它把原始的订单、库存与在途事实，转化为每个 SKU 的一条可审计决策：需求有多少、库存位置在哪里、是否存在补货缺口，以及在 MOQ / 订货倍数约束之后应该下多少量。每条结果都携带其证据与数据质量状态，并可通过多日仿真逐日复现。
 
 > 范围说明：这里的 “Agent” 指面向工具的决策组件 —— 一个可被调用的报告工具，加一层轻量 Web UI 封装。本仓库**不**实现自主规划、多 Agent 编排或基于 LLM 的决策。所有决策都来自明确、确定性的公式。
+>
+> 可选补充：仓库提供一个**默认关闭**的**大模型解释层**（`app/llm_explanation.py`），仅把已算好的决策结果转成自然语言说明，**不参与任何计算**。它不改变上述范围：决策仍全部来自确定性公式。
 
 ---
 
@@ -260,6 +262,117 @@ append_audit_records(path, records) -> None
 
 ---
 
+## 大模型解释层（可选，LLM Explanation Layer）
+
+**作用与边界**：把**已经算好的**决策结果（逐 SKU 的库存位置、再订货点、缺口、建议采购量、状态、原因、数据质量等）交给大模型，生成一段自然语言说明。
+
+- **不参与核心计算**：不参与需求计算、库存判断、再订货点计算、采购约束处理与补货数量计算；**不修改**任何数值或决策状态。
+- **输入白名单**：只发送 `app/llm_explanation.py` 中 `EXPLANATION_FIELDS` 列出的字段，不发送无关内部字段。
+- **调用位置**：仅在展示层 `app/demo.py` 中调用，独立于 `app/inventory.py` / `app/procurement.py`。
+- **默认关闭**：只有显式设置开关才调用。
+
+### 配置与启用
+
+| 环境变量 | 必需 | 说明 |
+|---|---|---|
+| `SCOS_LLM_EXPLANATION` | 是（启用开关） | `1` / `true` / `yes` 时启用；其它值或不设置则关闭 |
+| `OPENAI_API_KEY` | 启用时必需 | API Key，**只从环境变量读取**，不写入代码/配置/测试数据/日志 |
+| `SCOS_LLM_MODEL` | 启用时必需 | 模型名 |
+| `SCOS_LLM_BASE_URL` | 否 | OpenAI 兼容服务地址，默认 `https://api.openai.com/v1` |
+
+接口为 OpenAI 兼容的 `POST {base_url}/chat/completions`。
+
+```bash
+# 启用（Windows cmd）
+set SCOS_LLM_EXPLANATION=1
+set OPENAI_API_KEY=your-key
+set SCOS_LLM_MODEL=your-model
+python -X utf8 -m app.demo
+# PowerShell: $env:SCOS_LLM_EXPLANATION="1"; $env:OPENAI_API_KEY="..."; $env:SCOS_LLM_MODEL="..."
+
+# 关闭
+set SCOS_LLM_EXPLANATION=0
+```
+
+### 本地代理（可选：复用 Pi 已配置的凭据）
+
+若要让解释层复用 **Pi 已配置的凭据** 访问固定模型 `deepseek-v4-pro`，使用 `tools/pi_llm_proxy.mjs`：它在 `127.0.0.1` 上提供一个 OpenAI 兼容入口，把请求转成 `pi --mode rpc`（stdio JSONL）调用。**代理自身不读取任何 provider 凭据**，模型鉴权由 Pi 完成。
+
+> 定位：这是**可选的本机开发工具**，**不是**库存系统的运行时依赖 —— `app/` 的计算链路完全不使用它；解释层也可以直连任意 OpenAI 兼容服务而完全不启动代理。
+
+```bash
+# 启动（前台运行，Ctrl+C 关闭；不注册服务、不开机自启、不对外暴露）
+node tools/pi_llm_proxy.mjs
+# 启动横幅（stderr）给出实际端口与本次随机 Token（仅内存，只显示一次）
+```
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `PI_LLM_PROXY_PORT` | `8791` | 监听端口；被占用时自动改用临时端口（横幅会说明） |
+| `PI_CLI_PATH` | 自动解析 | Pi CLI 入口（pi-coding-agent/dist/bundle/cli.js）的绝对路径；仅在自动解析失败时设置 |
+| `PI_LLM_PROXY_SHOW_TOKEN` | `1` | 设为 `0`/`false`/`no` 时**不在横幅中显示 Token**（脚本化、日志重定向场景） |
+| `PI_LLM_PROXY_TOKEN` | 未设置 | 自行指定代理 Token（≥16 字符）以替代随机生成；`SHOW_TOKEN=0` 时客户端必须靠它认证 |
+
+把 Python 侧指向代理（**`OPENAI_API_KEY` 填代理 Token，不是 DeepSeek API Key**）：
+
+```bash
+set OPENAI_API_KEY=<代理启动时显示的 Token>
+set SCOS_LLM_BASE_URL=http://127.0.0.1:<实际端口>/v1
+set SCOS_LLM_MODEL=deepseek-v4-pro
+set SCOS_LLM_EXPLANATION=1
+python -X utf8 -m app.demo
+```
+
+- **两种凭据必须区分**：这里的 `OPENAI_API_KEY` 是**本地代理 Token**，只存在于代理进程内存；DeepSeek 凭据由 Pi 自己保管，代理既不读取也不转发。
+- **关闭**：在代理终端按 `Ctrl+C`；代理会终止在途 `pi` 子进程并关闭监听。客户端断开或超时同样会终止对应子进程。
+- **一次代理请求不保证只产生一次上游模型调用**：代理只在收到 RPC 的 `agent_settled` 时才返回；若 Pi 内部发生自动重试，可能带来**额外的模型调用与费用**，代理无法封顶。
+- **横幅中的 Token 是敏感凭据（SENSITIVE）**：它只显示一次、仅存在于内存，且**不是** DeepSeek API Key。请勿把 stderr 重定向到会被持久化或上传的文件。代理**不会**把 Token 写入应用日志、异常或普通诊断日志（日志只含 HTTP 方法、固定路由标签、状态码、耗时与固定原因标签）。
+- **输入限制**：请求体 ≤ 256 KiB；`messages` 1–20 条且 `content` 必须为字符串；system 提示词 ≤ 8 KiB（超出返回 400，且不会启动子进程）。
+- **环境前提**：需要本机已安装并配置好 Pi CLI，且 Pi 侧存在可用的 provider 凭据（模型名由代理固定传入，见下方限制；代理通过 `pi --mode rpc` 调用它）。仓库**不含** `package.json`，未引入任何 npm 依赖管理体系，**不要**为此新增依赖。
+- **已知环境耦合（provider / model 是固定项）**：代理内置的 provider / model 是**固定常量**（`deepseek` / `deepseek-v4-pro`），**不能**通过环境变量或请求体的 `model` 字段切换 —— 该字段只做类型校验、不参与选择（Python 客户端仍需设置 `SCOS_LLM_MODEL`，但它经本代理时不改变实际使用的模型）。CLI 路径解析（`PI_CLI_PATH`，或 `%APPDATA%/npm`、`~/.pi/agent/npm` 下的 pi-coding-agent 包内路径）与**本机安装**绑定；换机器或上游改变包结构后需要重新调整。未做跨机器移植验证。
+- **仅监听 `127.0.0.1`，不是生产服务**：不要暴露到网络、不要注册为常驻服务。**不含凭据不等于适合公开部署** —— `GET /health` 免鉴权、Token 为一次性内存值，都是面向本机单用户的设计。
+
+#### 如何获取 Token / 关闭显示 / 关闭后如何配置客户端
+
+- **默认（首次配置）**：启动代理后在 stderr 横幅中读取本次随机 Token，按下方示例写入 `OPENAI_API_KEY`。
+- **关闭显示**：设置 `PI_LLM_PROXY_SHOW_TOKEN=0`，横幅只显示 `token : hidden`。
+- **关闭后如何认证**：此时必须由你提供 Token —— 设置 `PI_LLM_PROXY_TOKEN=<你自备的长随机值>`（≥16 字符，否则代理拒绝启动），并在客户端把同一个值写入 `OPENAI_API_KEY`。**不要**把它写进仓库、日志或 issue；建议通过本机密钥管理器注入环境变量。
+- 关闭显示并不会削弱代理本身的鉴权：`Authorization: Bearer` 校验逻辑不变，只是不再把凭据打印到终端。
+
+#### HTTP 状态码（与实现一致）
+
+| 状态码 | 触发条件 | 响应体 |
+|---|---|---|
+| `200` | 生成完成；`choices[0].finish_reason` ∈ `stop` / `length` / `unknown` | OpenAI 兼容完成对象 |
+| `400` | 请求体不是合法 JSON 或不是对象；`messages` 为空或超过 20 条；`model`/`message.role`/`message.content` 类型不合法；system 提示词超过 8 KiB | `{"error":{"message",…,"type":"invalid_request_error"}}` |
+| `401` | `Authorization: Bearer` 缺失或与本次 Token 不符 | `authentication_error` |
+| `404` | 路径既不是 `/v1/chat/completions` 也不是 `GET /health` | `invalid_request_error` |
+| `405` | 路径为 `/v1/chat/completions` 但方法不是 `POST` | `invalid_request_error` |
+| `413` | 请求体超过 256 KiB | `invalid_request_error` |
+| `499` | 客户端在响应前断开（代理已中止对应的 `pi` 子进程）；无响应体 | — |
+| `502` | 子进程启动失败、RPC 命令失败、`stopReason` 为 `error`/`aborted`/`toolUse`、输出为空或非 JSON | `api_error` |
+| `504` | 代理侧 RPC 超时（默认 120 秒） | `timeout_error` |
+- **鉴权顺序**：`GET /health` 按既定规则免鉴权；**其他请求一律先鉴权**，通过后才做路由与方法检查。因此未携带合法 Token 时，未知路径与错误方法都返回 `401`；只有通过鉴权后才可能得到 `404` / `405` —— 未授权调用方无法用状态码探测存在哪些路由。
+
+- `finish_reason` 说明：`stop` = 正常结束；`length` = 被输出长度上限截断（**文本仍会返回，但已标记截断**）；`unknown` = 上游未报告 `stopReason`（保持兼容，不虚构成功原因）。`error`/`aborted`/`toolUse` 不会以 200 返回。
+- **客户端（`app/llm_explanation.py`）只接受 `finish_reason="stop"`**：`length`、`unknown`、字段缺失或任何其它取值（如 `content_filter`）都会抛出 `IncompleteExplanationError`（`RuntimeError` 的子类）。调用方**不会**收到被截断或未完成的文本；`app/demo.py` 捕获后打印 `[LLM_EXPLANATION_UNAVAILABLE] …`，确定性结果不受影响。
+- 上述结束状态目前仅由**模拟测试**覆盖（代理侧用例 32–37、客户端侧 `finish_reason` 契约用例）；**未对真实上游逐一验证**这些状态。
+- 注意：若本机设置了 `HTTP_PROXY` 或 `NODE_USE_ENV_PROXY`，Python 访问 `127.0.0.1` 需要 `NO_PROXY=127.0.0.1,localhost`（仅对该测试/运行进程设置即可）。
+
+### 失败降级
+
+请求超时、认证失败、网络错误、返回格式异常、请求构造或序列化失败（例如结果帧中出现无法 JSON 序列化的值）、结束状态不是 `stop`（`length` / `unknown` / 字段缺失 / 其它取值）或未配置时，解释层只打印 `[LLM_EXPLANATION_UNAVAILABLE] ...` 提示，**绝不中断**确定性决策输出，也**不伪造**成功的解释。默认 90 秒超时（代理侧 RPC 预算 120 秒，客户端先于代理放弃），不做自动重试；超时或客户端断开后会终止对应的 `pi` 子进程。
+
+### 完成程度（如实）
+
+- 已实现：白名单投影、OpenAI 兼容调用、超时与失败降级、展示层接入、可选本地代理（`tools/pi_llm_proxy.mjs`）、单元与集成测试（默认全部用 mock，无需真实 Key）。
+- **真实端到端调用历史：两次独立调用，不是同一次测试**。① 阶段 2.7C：`app/llm_explanation.py` → 本地 `127.0.0.1` 代理 → 真实 `pi --mode rpc` → `deepseek-v4-pro`，返回非空中文解释（HTTP 200，约 30.12 秒）。② 阶段 3.0：同一链路复跑一次，用于验证严格的 `finish_reason` 契约，HTTP 200 / `finish=stop`，约 49 秒（代理日志 ms≈49164），Python 退出码 0。
+- **尚未验证**：并发请求、长期运行稳定性、其他模型或服务商、以及默认 OpenAI 端点（需使用者自备可用服务）。
+- **库存计算始终由确定性逻辑完成**：大模型只生成解释文本，不参与需求、库存、再订货点、采购约束与补货数量的任何计算。
+- 解释文本**不写入**审计 JSONL（审计仅记录确定性决策投影，格式未改动）。
+
+---
+
 ## 项目结构
 
 ```
@@ -272,7 +385,8 @@ supplychain-os/
 │   ├── procurement.py    # 采购建议 Level 2（MOQ / 倍数）
 │   ├── audit_log.py      # JSONL 审计投影（不重算）
 │   ├── simulator.py      # 多日仿真器（复用以上各层）
-│   └── demo.py           # CLI 入口：加载 -> 计算 -> 打印
+│   ├── demo.py           # CLI 入口：加载 -> 计算 -> 打印
+│   └── llm_explanation.py # 可选：大模型解释层（默认关闭，只解释不改数）
 ├── data/
 │   ├── inventory.csv
 │   ├── orders.csv
@@ -286,9 +400,13 @@ supplychain-os/
 │   ├── test_inventory.py
 │   ├── test_procurement.py
 │   ├── test_audit_log.py
-│   └── test_simulator.py
+│   ├── test_simulator.py
+│   └── test_llm_explanation.py
 ├── requirements.txt
-└── dev-requirements.txt
+├── dev-requirements.txt
+└── tools/                          # 可选本地开发工具（不是库存系统的运行时依赖）
+    ├── pi_llm_proxy.mjs            # Pi RPC 代理（仅监听 127.0.0.1；需本机 Pi）
+    └── pi_llm_proxy.test.mjs       # 代理测试：node --test tools/pi_llm_proxy.test.mjs
 ```
 
 ---
@@ -308,7 +426,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-运行时依赖：`pandas`。核心引擎没有数据库、没有 Web 框架、也没有 LLM 依赖。
+运行时依赖：`pandas`。核心引擎没有数据库、没有 Web 框架、也没有 LLM 依赖。可选的大模型解释层只使用 Python 标准库，**不新增任何依赖**。
 
 ---
 
@@ -324,6 +442,8 @@ Demo 会加载 CSV、运行完整链路，并把决策报告打印到 stdout —
 
 Demo 只是展示入口 —— 它自身不包含任何业务公式。
 
+如需让大模型解释决策结果（**可选，默认关闭**），见下文“大模型解释层”。未设置 `SCOS_LLM_EXPLANATION` 时，解释层完全不调用。
+
 ---
 
 ## 运行测试（Run Tests）
@@ -331,9 +451,12 @@ Demo 只是展示入口 —— 它自身不包含任何业务公式。
 ```bash
 pip install -r dev-requirements.txt
 python -m pytest -q
+
+# 可选本地代理的测试（只用 Node 内置模块，无需 npm install）
+node --test tools/pi_llm_proxy.test.mjs
 ```
 
-当前测试套件：**218 passed**。
+当前测试套件：**262 passed**（其中 `tests/test_llm_explanation.py` 44 条）。Node 侧代理测试 **37 passed / 1 skipped**：跳过者为用例 19 的真实 Pi 握手，仅在显式设置 `PI_RPC_SMOKE=1` 时运行，常规回归不设置。本机实测 Node v24.16.0；仓库未声明 Node 版本要求，也未引入 npm 依赖管理。
 
 测试覆盖需求窗口与趋势边界、Level 1 数学与状态规则、在途聚合、Level 2 约束链、输入 fail-fast 校验、审计日志投影与 JSONL 行为，以及仿真器的确定性 / 到货顺序 / 库存守恒。
 
@@ -375,8 +498,9 @@ python -m pytest -q
 - 数据质量状态与结构化风险提示。
 - 确定性的多日仿真器。
 - 审计日志（追加式 JSONL 投影）。
+- 大模型决策解释层（可选，默认关闭；只解释、不改数；见上）。
 
-测试套件：**218 passed**。
+测试套件：**262 passed**。
 
 ---
 

@@ -10,6 +10,7 @@
 本模块只负责「加载 → 调用 → 展示」，不复制任何计算。
 展示的每个数值都直接取自结果帧，绝不在此重新计算。
 """
+import os
 from datetime import date
 
 import pandas as pd
@@ -34,6 +35,27 @@ def format_number(value) -> str:
     if value is None or pd.isna(value):
         return "N/A"
     return f"{float(value):.10f}".rstrip("0").rstrip(".")
+
+
+def _print_llm_explanation(frame) -> None:
+    """可选：由大模型解释**已经算好**的决策结果（默认关闭）。
+
+    开关：环境变量 SCOS_LLM_EXPLANATION=1/true/yes。
+    本层只读取结果帧，绝不重算或修改任何业务字段；未配置或调用失败时
+    只打印提示，**不中断**上面的确定性决策输出。
+    """
+    if os.getenv("SCOS_LLM_EXPLANATION", "0").strip().lower() not in {"1", "true", "yes"}:
+        return
+
+    from app.llm_explanation import explain_decisions
+
+    print("\n" + "-" * 40)
+    print("大模型辅助解释（不参与计算）")
+    print("-" * 40)
+    try:
+        print(explain_decisions(frame))
+    except (RuntimeError, ValueError) as exc:
+        print(f"[LLM_EXPLANATION_UNAVAILABLE] {exc}")
 
 
 def main(as_of_date: date | None = None):
@@ -119,6 +141,9 @@ def main(as_of_date: date | None = None):
             print(f"[{w['code']}] {w['sku']}: {w['message']}")
     else:
         print("无")
+
+    # 可选的大模型解释层：默认关闭，仅在显式开关下调用；任何失败都不影响上面的确定性结果
+    _print_llm_explanation(frame)
 
 
 if __name__ == "__main__":

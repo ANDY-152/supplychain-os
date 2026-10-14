@@ -15,6 +15,11 @@ status, and can be replayed day by day with a multi-day simulator.
 > callable report tool plus a thin Web UI wrapper. This repository does **not**
 > implement autonomous planning, multi-agent orchestration, or LLM-based
 > decision making. All decisions come from explicit, deterministic formulas.
+>
+> Optional add-on: the repository also ships an **opt-in, disabled-by-default LLM
+> explanation layer** (`app/llm_explanation.py`) that only turns already-computed
+> decisions into prose. It never participates in any calculation, so the scope
+> statement above still holds.
 
 ---
 
@@ -331,7 +336,8 @@ supplychain-os/
 │   ├── procurement.py    # Procurement Recommendation Level 2 (MOQ / multiple)
 │   ├── audit_log.py      # JSONL audit projection (no recomputation)
 │   ├── simulator.py      # Multi-day simulator (reuses the layers above)
-│   └── demo.py           # CLI entry point: load -> compute -> print
+│   ├── demo.py           # CLI entry point: load -> compute -> print
+│   └── llm_explanation.py # optional: LLM explanation layer (off by default, explains only)
 ├── data/
 │   ├── inventory.csv
 │   ├── orders.csv
@@ -345,9 +351,13 @@ supplychain-os/
 │   ├── test_inventory.py
 │   ├── test_procurement.py
 │   ├── test_audit_log.py
-│   └── test_simulator.py
+│   ├── test_simulator.py
+│   └── test_llm_explanation.py
 ├── requirements.txt
-└── dev-requirements.txt
+├── dev-requirements.txt
+└── tools/                          # optional local developer tooling (NOT a runtime dependency)
+    ├── pi_llm_proxy.mjs            # Pi RPC proxy (binds 127.0.0.1 only; needs a local Pi)
+    └── pi_llm_proxy.test.mjs       # proxy tests: node --test tools/pi_llm_proxy.test.mjs
 ```
 
 ---
@@ -368,7 +378,8 @@ pip install -r requirements.txt
 ```
 
 Runtime dependency: `pandas`. There is no database, no web framework, and no
-LLM dependency in the core engine.
+LLM dependency in the core engine. The optional LLM explanation layer uses only
+the Python standard library and adds **no** new dependency.
 
 ---
 
@@ -396,9 +407,12 @@ its own.
 ```bash
 pip install -r dev-requirements.txt
 python -m pytest -q
+
+# optional local proxy tests (Node built-ins only; no npm install needed)
+node --test tools/pi_llm_proxy.test.mjs
 ```
 
-Current suite: **218 passed**.
+Current suite: **262 passed** (including 44 cases in `tests/test_llm_explanation.py`). Proxy suite: **37 passed / 1 skipped** — the skipped case is #19, a real Pi RPC handshake that only runs when `PI_RPC_SMOKE=1` is set; normal regression runs leave it unset. Verified locally on Node v24.16.0; the repository declares no Node version requirement and adds no npm dependency management.
 
 The tests cover demand windows and trend boundaries, Level 1 math and status
 rules, in-transit aggregation, Level 2 constraint chains, fail-fast input
@@ -407,6 +421,63 @@ determinism / arrival ordering / stock conservation.
 
 ---
 
+## Optional LLM Explanation Layer
+
+The engine can optionally explain decisions it has **already computed**. It is
+disabled unless `SCOS_LLM_EXPLANATION=1` (or `true` / `yes`) is set, and it never
+calculates, replaces or modifies a quantity: the model receives an allowlisted
+projection of the finished decision frame and returns prose. The layer is called
+only from the display entry point (`app/demo.py`), after every deterministic
+number has already been printed.
+
+| Environment variable | Required | Meaning |
+|---|---|---|
+| `SCOS_LLM_EXPLANATION` | yes (opt-in switch) | `1` / `true` / `yes` enables the layer; anything else leaves it off |
+| `OPENAI_API_KEY` | when enabled | read from the environment only; never written to code, config, test data or logs |
+| `SCOS_LLM_MODEL` | when enabled | model name |
+| `SCOS_LLM_BASE_URL` | no | OpenAI-compatible endpoint, default `https://api.openai.com/v1` |
+
+- **A failure never breaks the deterministic report**: timeouts, auth errors,
+  network errors, malformed responses, request-construction or serialization
+  failures, a `finish_reason` other than `stop`, or missing configuration print
+  `[LLM_EXPLANATION_UNAVAILABLE] ...` and leave the deterministic output
+  untouched. There is no automatic retry.
+- **Only a complete answer is accepted**: the client requires
+  `finish_reason == "stop"`; `length`, `unknown`, a missing field or any other
+  value raises `IncompleteExplanationError` (a `RuntimeError` subclass), so a
+  truncated or unfinished answer is never handed back as if it were complete.
+- The explanation text is **not** written to the audit JSONL.
+- Two real end-to-end calls have been made in total (one per stage: about 30.12 s
+  and about 49 s). Concurrency, long-running stability, other model providers and
+  the default OpenAI endpoint are still **unverified**.
+
+### Optional local proxy (`tools/pi_llm_proxy.mjs`)
+
+To reuse the credentials already configured in Pi for a fixed model
+(`deepseek-v4-pro`), the repository also ships a small proxy that exposes an
+OpenAI-compatible endpoint on
+`127.0.0.1` and forwards requests to `pi --mode rpc` (stdio JSONL). The proxy
+never reads provider credentials; Pi performs the authentication.
+
+- It is an **optional local developer tool**, **not** a runtime dependency of the
+  inventory system: no code path under `app/` uses it, and the explanation layer
+  can talk to any OpenAI-compatible service without starting it.
+- It requires a locally installed and configured Pi CLI. The provider/model pair is
+  **fixed** inside the proxy (`deepseek` / `deepseek-v4-pro`): it cannot be switched
+  via an environment variable or via the request body `model` field, which is only
+  type-checked. The CLI path resolution is coupled to that local installation;
+  cross-machine portability has **not** been verified.
+- It binds `127.0.0.1` only and is **not** a production service: do not expose it,
+  do not register it as a service. Being credential-free does **not** make it safe
+  to deploy publicly.
+- The repository contains no `package.json` and introduces no npm dependency
+  management.
+- Request/response limits and the complete HTTP status-code table — including that
+  every request except `GET /health` is authenticated **before** routing, so an
+  unauthorized call gets `401` rather than `404` / `405` — are documented in
+  `README.md` (Chinese).
+
+---
 ## Web UI
 
 The engine is UI-agnostic: everything relevant is printed as deterministic
@@ -454,8 +525,10 @@ Implemented and tested:
 - Data-quality status and structured risk warnings.
 - Multi-day deterministic Simulator.
 - Audit Log (append-only JSONL projection).
+- LLM decision explanation layer (optional, disabled by default; explains only,
+  never changes a number).
 
-Test suite: **218 passed**.
+Test suite: **262 passed**.
 
 ---
 
