@@ -470,6 +470,9 @@ never reads provider credentials; Pi performs the authentication.
 - It binds `127.0.0.1` only and is **not** a production service: do not expose it,
   do not register it as a service. Being credential-free does **not** make it safe
   to deploy publicly.
+- There is no cap on in-flight requests: a local caller holding a valid proxy token
+  can start several `pi` child processes at once, which can mean additional upstream
+  model calls and cost.
 - The repository contains no `package.json` and introduces no npm dependency
   management.
 - Request/response limits and the complete HTTP status-code table — including that
