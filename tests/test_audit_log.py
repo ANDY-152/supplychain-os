@@ -162,6 +162,21 @@ def test_nan_is_normalized_to_none():
     assert record["coverage_days"] is None
 
 
+def test_inf_is_normalized_to_none():
+    for bad in (float("inf"), float("-inf")):
+        record = build_audit_records(frame(full_row(coverage_days=bad)))[0]
+        assert record["coverage_days"] is None
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_persists_as_json_null(tmp_path, bad):
+    path = tmp_path / "audit.jsonl"
+    append_audit_records(path, build_audit_records(frame(full_row(coverage_days=bad))))
+    text = path.read_text(encoding="utf-8")
+    assert "NaN" not in text and "Infinity" not in text
+    assert json.loads(text)["coverage_days"] is None
+
+
 def test_nat_is_normalized_to_none():
     record = build_audit_records(frame(full_row(as_of_date=pd.NaT)))[0]
     assert record["as_of_date"] is None
@@ -229,6 +244,14 @@ def test_append_empty_records_writes_nothing(tmp_path):
     path = tmp_path / "audit.jsonl"
     append_audit_records(path, [])
     assert path.read_text(encoding="utf-8") == ""
+
+
+def test_append_serializes_before_opening_file(tmp_path):
+    # 先整体序列化：任一条目不可序列化时不得创建/改动文件
+    path = tmp_path / "audit.jsonl"
+    with pytest.raises(TypeError):
+        append_audit_records(path, [{"bad": object()}])
+    assert not path.exists()
 
 
 # --- 4. 无系统时钟 ----------------------------------------------------------

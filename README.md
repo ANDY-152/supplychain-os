@@ -65,6 +65,7 @@
 - **需求引擎（Demand Engine）** —— 滚动 30 天 / 7 天日均需求、需求趋势与数据质量状态。
 - **库存决策（Inventory Decision，Level 1）** —— 覆盖天数、再订货点、库存位置、带符号缺口、非负补货量，以及状态。
 - **采购建议（Procurement Recommendation，Level 2）** —— 对 Level 1 缺口施加 MOQ 与订货倍数，给出最终建议采购量。
+- **预算约束分配（Budget-Constrained Allocation，Level 3）** —— 在 Level 2 建议量上施加共享周期预算，提供 R0 / R1 / R2 三种确定性分配规则（可选，默认关闭）。
 - **在途处理（In-transit handling）** —— 仅 `OPEN` 采购订单计入供给；逾期 `OPEN` 订单作为风险暴露，但不会被自动移除。
 - **数据质量（Data Quality）** —— `OK` / `INSUFFICIENT_HISTORY` / `UNKNOWN_HISTORY`，外加结构化风险提示；数据质量永远不会静默改变核心数量。
 - **多日仿真器（Multi-day Simulator）** —— 确定性的逐日状态推进，复用同一套需求 / 库存 / 采购逻辑。
@@ -183,6 +184,23 @@ provisional = data_quality_status != "OK"
 | Level 2 | `procurement_recommended_qty` | 施加 MOQ 与订货倍数之后的**采购建议数量**。 |
 
 Level 1 永远不会被 Level 2 改写；两者并排保留，使取整决策保持可审计。
+
+---
+
+## 预算约束分配 Level 3（Budget-Constrained Allocation）
+
+`app/allocation.py` 在 Level 2 结果帧上**只追加**预算分配列，不改写 Level 1 / Level 2 的任何列。仅当调用方显式传入 `algorithm` 时才启用；不传时保持原有行为。
+
+- **输入**：Level 2 结果帧 + `costs`（每 SKU 单位成本）+ `priority`（整数优先级）+ `budget_available`（当日可用预算）+ 可选 `constraints`（`moq` / `order_multiple`）。
+- **R0**：基线；`allocated_qty = procurement_recommended_qty` 原值透传，不读取预算。
+- **R1**：在共享预算下按比例缩放；金额以整数分核算，按订货倍数向下取整，低于最小可行包则归零。
+- **R2**：按分配排名（优先级为主键，覆盖率−交期、建议量、SKU 为次级键）贪心整包装分配，逐 SKU 检查剩余预算与最小可行包。
+- **预算语义**：`budget_available` 为当日可用预算；`run_simulation` 中预算按周期重置（`cycle_days`），支出逐日累计且不结转；中途开始需显式提供初始支出。
+- **约束**：MOQ 与订货倍数由 `constraints` 施加；在途仅 `OPEN` 计入，逾期 `OPEN` 不自动移除。
+- **审计**：L3 启用时，DECISION 记录在既有字段之后**条件追加** 10 列：`algorithm, period_index, allocation_rank, allocated_qty, allocation_reason, unit_cost, priority, budget_available_before, budget_spent_today, budget_remaining_after`；L3 关闭时既有键集与顺序不变。
+- **实验工具（可选）**：`tools/l3_experiment.py`（需求 / 优先级 / 标定 / 指标辅助）与 `tools/run_l3_experiment.py`（按情景运行 R0/R1/R2 × 预算档位）。
+
+**边界与限制**：R1 / R2 需要成本与优先级配置，且要求建议量为整数并满足 MOQ / 倍数；模型允许负库存（backorder 语义），缺货类指标须按其口径解释；`data/costs.csv` 为示例 / 模拟成本输入。
 
 ---
 
@@ -384,6 +402,7 @@ supplychain-os/
 │   ├── demand.py         # 需求引擎（30D / 7D、趋势、质量）
 │   ├── inventory.py      # 库存决策 Level 1 + 在途聚合
 │   ├── procurement.py    # 采购建议 Level 2（MOQ / 倍数）
+│   ├── allocation.py     # 预算约束分配 Level 3（R0 / R1 / R2）
 │   ├── audit_log.py      # JSONL 审计投影（不重算）
 │   ├── simulator.py      # 多日仿真器（复用以上各层）
 │   ├── demo.py           # CLI 入口：加载 -> 计算 -> 打印
@@ -394,21 +413,34 @@ supplychain-os/
 │   ├── in_transit.csv
 │   ├── products.csv
 │   ├── data_metadata.csv            # 声明 coverage_start
-│   └── procurement_constraints.csv  # 每 SKU 的 moq / order_multiple
+│   ├── procurement_constraints.csv  # 每 SKU 的 moq / order_multiple
+│   └── costs.csv                    # 研究用模拟成本（非海尔真实采购成本）
 ├── tests/
 │   ├── test_data_loader.py
 │   ├── test_demand.py
 │   ├── test_inventory.py
 │   ├── test_procurement.py
+│   ├── test_allocation.py
+│   ├── test_allocation_r1_exact.py
+│   ├── test_allocation_r2_exact.py
 │   ├── test_audit_log.py
 │   ├── test_simulator.py
+│   ├── test_integration_l3.py
+│   ├── test_l3_experiment.py
+│   ├── test_load_costs.py
 │   └── test_llm_explanation.py
 ├── requirements.txt
 ├── dev-requirements.txt
 └── tools/                          # 可选本地开发工具（不是库存系统的运行时依赖）
     ├── pi_llm_proxy.mjs            # Pi RPC 代理（仅监听 127.0.0.1；需本机 Pi）
-    └── pi_llm_proxy.test.mjs       # 代理测试：node --test tools/pi_llm_proxy.test.mjs
+    ├── pi_llm_proxy.test.mjs       # 代理测试：node --test tools/pi_llm_proxy.test.mjs
+    ├── generate_simulated_costs.py # 确定性生成 data/costs.csv（研究用模拟成本）
+    ├── l3_experiment.py            # Level 3 实验辅助（需求 / 优先级 / 标定 / 指标）
+    └── run_l3_experiment.py        # Level 3 实验 runner（R0/R1/R2 × 预算档位）
 ```
+
+> **数据性质说明**：`data/costs.csv` 为**研究用模拟成本，非海尔真实采购成本**，
+> 由 `tools/generate_simulated_costs.py` 依据 `data/inventory.csv` 的 SKU 集确定性生成。
 
 ---
 
@@ -457,7 +489,7 @@ python -m pytest -q
 node --test tools/pi_llm_proxy.test.mjs
 ```
 
-当前测试套件：**262 passed**（其中 `tests/test_llm_explanation.py` 44 条）。Node 侧代理测试 **37 passed / 1 skipped**：跳过者为用例 19 的真实 Pi 握手，仅在显式设置 `PI_RPC_SMOKE=1` 时运行，常规回归不设置。本机实测 Node v24.16.0；仓库未声明 Node 版本要求，也未引入 npm 依赖管理。
+当前测试套件：**458 passed**（其中 `tests/test_llm_explanation.py` 44 条）。Node 侧代理测试 **37 passed / 1 skipped**：跳过者为用例 19 的真实 Pi 握手，仅在显式设置 `PI_RPC_SMOKE=1` 时运行，常规回归不设置。本机实测 Node v24.16.0；仓库未声明 Node 版本要求，也未引入 npm 依赖管理。
 
 测试覆盖需求窗口与趋势边界、Level 1 数学与状态规则、在途聚合、Level 2 约束链、输入 fail-fast 校验、审计日志投影与 JSONL 行为，以及仿真器的确定性 / 到货顺序 / 库存守恒。
 
@@ -496,12 +528,13 @@ node --test tools/pi_llm_proxy.test.mjs
 - 库存决策 Level 1（再订货点、库存位置、缺口、补货量、状态）。
 - 在途处理（仅 OPEN 计入供给，逾期作为风险）。
 - 采购建议 Level 2（MOQ 与订货倍数）。
+- 预算约束分配 Level 3（R0 / R1 / R2；整数分预算、周期重置、可选审计列）。
 - 数据质量状态与结构化风险提示。
 - 确定性的多日仿真器。
 - 审计日志（追加式 JSONL 投影）。
 - 大模型决策解释层（可选，默认关闭；只解释、不改数；见上）。
 
-测试套件：**262 passed**。
+测试套件：**458 passed**。
 
 ---
 

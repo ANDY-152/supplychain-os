@@ -1,4 +1,5 @@
 """Read CSV files from data/, with column checks."""
+import math
 from datetime import date, datetime
 from pathlib import Path
 
@@ -15,6 +16,8 @@ DATA_METADATA_COLUMNS = {"key", "value"}
 COVERAGE_START_KEY = "coverage_start"
 # procurement_constraints.csv：按 SKU 的 Level 2 采购约束（moq / order_multiple）
 PROCUREMENT_CONSTRAINTS_COLUMNS = {"sku", "moq", "order_multiple"}
+# costs.csv：Level 3 单位采购成本（A3：新增独立文件，不改既有 loader）
+COSTS_COLUMNS = {"sku", "unit_cost"}
 
 
 def load_csv(name: str, required: set[str] = frozenset(), **read_csv_kwargs) -> pd.DataFrame:
@@ -136,3 +139,57 @@ def load_procurement_constraints(
 
 def _empty_constraints() -> pd.DataFrame:
     return pd.DataFrame(columns=["sku", "moq", "order_multiple"])
+
+
+def load_costs(name: str = "costs.csv", **read_csv_kwargs) -> pd.DataFrame:
+    """costs.csv -> 一行一个 SKU：`sku, unit_cost`（Level 3 单位采购成本）。
+
+    A3：新增函数，既有 loader 一行不改。
+    - 默认在 DATA_DIR 下解析 `name`；若 `name` 为显式路径（绝对路径或含目录），
+      则按原样读取，供实验数据目录隔离（v4.4 §7.1）。
+    - fail-loud：文件不存在/为空、缺列、空 sku、重复 sku、
+      unit_cost 非数值 / NaN / 非有限 / 非正，一律报错。
+    - 绝不 fillna、绝不生成默认值。
+    """
+    path = Path(name)
+    if not path.is_absolute() and path.parent == Path("."):
+        path = DATA_DIR / path
+    if not path.exists() or path.stat().st_size == 0:
+        raise ValueError(f"costs file missing or empty: {path}")
+
+    df = pd.read_csv(path, **read_csv_kwargs)
+    missing = COSTS_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {sorted(missing)}")
+    df = df[["sku", "unit_cost"]]
+    if df.empty:
+        raise ValueError("costs file has no data rows")
+
+    blank = df["sku"].isna() | (df["sku"].astype(str).str.strip() == "")
+    if blank.any():
+        raise ValueError(f"blank sku in costs: {int(blank.sum())} row(s)")
+
+    duplicated = df["sku"].duplicated()
+    if duplicated.any():
+        raise ValueError(f"duplicate cost SKU: {sorted(df['sku'][duplicated].unique().tolist())}")
+
+    try:
+        unit = pd.to_numeric(df["unit_cost"])
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"invalid unit_cost: {e}") from e
+    if unit.isna().any():
+        raise ValueError("null unit_cost in costs")
+    if (unit <= 0).any():
+        raise ValueError(f"unit_cost must be > 0: {df['sku'][unit <= 0].tolist()}")
+    finite = unit.map(_is_finite)
+    if (~finite).any():
+        raise ValueError(f"unit_cost must be finite: {df['sku'][~finite].tolist()}")
+
+    return df.assign(unit_cost=unit.astype(float)).reset_index(drop=True)
+
+
+def _is_finite(value) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False

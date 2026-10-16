@@ -44,12 +44,27 @@ BUSINESS_COLUMNS = (
 )
 
 ACTION_FIELDS = ("order_placed_qty", "po_id", "expected_date")
+
+# Level 3 审计字段（仅当结果帧携带这些列时条件投影；顺序冻结，见裁决清单 A-1）
+L3_COLUMNS = (
+    "algorithm",
+    "period_index",
+    "allocation_rank",
+    "allocated_qty",
+    "allocation_reason",
+    "unit_cost",
+    "priority",
+    "budget_available_before",
+    "budget_spent_today",
+    "budget_remaining_after",
+)
 RECORD_TYPE = "DECISION"
 
 __all__ = [
     "ENVELOPE_COLUMNS",
     "BUSINESS_COLUMNS",
     "ACTION_FIELDS",
+    "L3_COLUMNS",
     "RECORD_TYPE",
     "build_audit_records",
     "append_audit_records",
@@ -62,12 +77,15 @@ def build_audit_records(frame, action=None) -> list[dict]:
     frame 必须携带信封列 run_id / simulation_day / as_of_date / sku。
     action: {sku: {"order_placed_qty": float, "po_id": str | None, "expected_date": str | None}}。
     不修改 frame / action，不重算任何业务指标。
+    L3 字段（`L3_COLUMNS`）：仅当结果帧携带对应列时，于 ACTION_FIELDS 之后按固定顺序
+    逐列条件投影；帧内无 L3 列时输出与集成前完全一致。
     """
     missing = [column for column in ENVELOPE_COLUMNS if column not in frame.columns]
     if missing:
         raise ValueError(f"audit frame missing envelope columns: {missing}")
 
     present = [column for column in BUSINESS_COLUMNS if column in frame.columns]
+    l3_present = [column for column in L3_COLUMNS if column in frame.columns]
     lookup = action or {}
 
     records = []
@@ -85,16 +103,23 @@ def build_audit_records(frame, action=None) -> list[dict]:
         sku_action = lookup.get(sku) or {}
         for field in ACTION_FIELDS:
             record[field] = _to_native(sku_action.get(field))
+        for column in l3_present:
+            record[column] = _to_native(row[column])
         records.append(record)
     return records
 
 
 def append_audit_records(path, records) -> None:
-    """append 一行一个 JSON object；UTF-8；ensure_ascii=False；不覆盖；失败抛异常。"""
+    """append 一行一个 JSON object；UTF-8；ensure_ascii=False；不覆盖；失败抛异常。
+
+    先整体序列化为一个 payload（任一条目序列化失败时不打开文件），再单次写入。
+    单次写入只缩小部分写入窗口，**不提供跨资源原子性或磁盘事务保证**。
+    """
+    payload = "".join(
+        json.dumps(record, ensure_ascii=False) + "\n" for record in records
+    )
     with Path(path).open("a", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False))
-            handle.write("\n")
+        handle.write(payload)
 
 
 def _iso(value):
@@ -108,7 +133,11 @@ def _iso(value):
 
 
 def _to_native(value):
-    """numpy 标量 / NaN / NaT -> 原生 Python，便于 json.dumps 且不改语义。"""
+    """numpy 标量 / 非有限浮点（NaN/±inf）/ NaT -> 原生 Python，便于 json.dumps 且不改语义。
+
+    JSON（RFC 8259）不允许 NaN/Infinity；故非有限 float 一律归一为 None（JSON null），
+    避免 json.dumps 默认产生非严格 JSON 的 `NaN`/`Infinity`/`-Infinity`。
+    """
     if value is None:
         return None
     item = getattr(value, "item", None)
@@ -117,7 +146,7 @@ def _to_native(value):
             value = value.item()
         except (ValueError, AttributeError):
             return value
-    if isinstance(value, float) and math.isnan(value):
+    if isinstance(value, float) and not math.isfinite(value):
         return None
     try:
         if value != value:  # NaN / NaT

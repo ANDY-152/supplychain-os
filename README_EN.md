@@ -85,6 +85,9 @@ earlier layer's numbers.
   position, signed shortage, non-negative replenishment quantity, and status.
 - **Procurement Recommendation (Level 2)** — applies MOQ and order multiple to
   the Level 1 gap and reports a final recommended order quantity.
+- **Budget-Constrained Allocation (Level 3)** — applies a shared per-cycle budget
+  on top of the Level 2 recommendation, with three deterministic rules R0 / R1 /
+  R2 (optional, disabled by default).
 - **In-transit handling** — only `OPEN` purchase orders count toward supply;
   overdue `OPEN` orders are surfaced as risk without being auto-removed.
 - **Data Quality** — `OK` / `INSUFFICIENT_HISTORY` / `UNKNOWN_HISTORY` plus
@@ -224,6 +227,43 @@ rounding decision stays auditable.
 
 ---
 
+## Budget-Constrained Allocation (Level 3)
+
+`app/allocation.py` **appends** budget-allocation columns to the Level 2 frame
+without rewriting any Level 1 / Level 2 column. It is enabled only when the
+caller passes `algorithm`; otherwise the original behaviour is unchanged.
+
+- **Inputs**: Level 2 frame + `costs` (per-SKU unit cost) + `priority` (integer)
+  + `budget_available` (budget available that day) + optional `constraints`
+  (`moq` / `order_multiple`).
+- **R0**: baseline; `allocated_qty = procurement_recommended_qty`, no budget read.
+- **R1**: proportional scaling under the shared budget; amounts computed in
+  integer cents, floored to whole order multiples, and zeroed below the minimum
+  feasible pack.
+- **R2**: greedy whole-pack allocation by allocation rank (priority as primary
+  key; coverage − lead time, recommendation, SKU as tie-breakers), checking the
+  remaining budget and minimum pack per SKU.
+- **Budget semantics**: `budget_available` is the budget available that day; in
+  `run_simulation` the budget resets per cycle (`cycle_days`) with no carry-over,
+  and mid-cycle starts require an explicit initial spend.
+- **Constraints**: MOQ / order multiple come from `constraints`; only `OPEN`
+  in-transit orders count as supply, overdue `OPEN` orders are not auto-removed.
+- **Audit**: when Level 3 is on, DECISION records conditionally append 10 columns
+  after the existing fields: `algorithm, period_index, allocation_rank,
+  allocated_qty, allocation_reason, unit_cost, priority,
+  budget_available_before, budget_spent_today, budget_remaining_after`; when off,
+  the existing key set and order are unchanged.
+- **Experiment tooling (optional)**: `tools/l3_experiment.py` (demand / priority /
+  calibration / metrics helpers) and `tools/run_l3_experiment.py` (runs
+  R0/R1/R2 × budget tiers per scenario).
+
+**Limits**: R1 / R2 require cost and priority config and integer recommendations
+that satisfy MOQ / multiple; the model allows negative stock (backorder
+semantics), so shortage-style metrics must be read with that in mind;
+`data/costs.csv` is an example / simulated cost input.
+
+---
+
 ## Data Quality
 
 The Demand Engine returns a data-quality status:
@@ -334,6 +374,7 @@ supplychain-os/
 │   ├── demand.py         # Demand Engine (30D / 7D, trend, quality)
 │   ├── inventory.py      # Inventory Decision Level 1 + in-transit aggregation
 │   ├── procurement.py    # Procurement Recommendation Level 2 (MOQ / multiple)
+│   ├── allocation.py     # Budget-Constrained Allocation Level 3 (R0 / R1 / R2)
 │   ├── audit_log.py      # JSONL audit projection (no recomputation)
 │   ├── simulator.py      # Multi-day simulator (reuses the layers above)
 │   ├── demo.py           # CLI entry point: load -> compute -> print
@@ -344,21 +385,34 @@ supplychain-os/
 │   ├── in_transit.csv
 │   ├── products.csv
 │   ├── data_metadata.csv            # declares coverage_start
-│   └── procurement_constraints.csv  # per-SKU moq / order_multiple
+│   ├── procurement_constraints.csv  # per-SKU moq / order_multiple
+│   └── costs.csv                    # example / simulated unit costs (not real)
 ├── tests/
 │   ├── test_data_loader.py
 │   ├── test_demand.py
 │   ├── test_inventory.py
 │   ├── test_procurement.py
+│   ├── test_allocation.py
+│   ├── test_allocation_r1_exact.py
+│   ├── test_allocation_r2_exact.py
 │   ├── test_audit_log.py
 │   ├── test_simulator.py
+│   ├── test_integration_l3.py
+│   ├── test_l3_experiment.py
+│   ├── test_load_costs.py
 │   └── test_llm_explanation.py
 ├── requirements.txt
 ├── dev-requirements.txt
 └── tools/                          # optional local developer tooling (NOT a runtime dependency)
     ├── pi_llm_proxy.mjs            # Pi RPC proxy (binds 127.0.0.1 only; needs a local Pi)
-    └── pi_llm_proxy.test.mjs       # proxy tests: node --test tools/pi_llm_proxy.test.mjs
+    ├── pi_llm_proxy.test.mjs       # proxy tests: node --test tools/pi_llm_proxy.test.mjs
+    ├── generate_simulated_costs.py # deterministically generates data/costs.csv (simulated)
+    ├── l3_experiment.py            # Level 3 experiment helpers (demand / priority / calibration / metrics)
+    └── run_l3_experiment.py        # Level 3 experiment runner (R0/R1/R2 × budget tiers)
 ```
+
+> **Data note**: `data/costs.csv` is an **example / simulated** cost input, not real
+> procurement cost data, generated deterministically from the SKU set in `data/inventory.csv`.
 
 ---
 
@@ -412,7 +466,7 @@ python -m pytest -q
 node --test tools/pi_llm_proxy.test.mjs
 ```
 
-Current suite: **262 passed** (including 44 cases in `tests/test_llm_explanation.py`). Proxy suite: **37 passed / 1 skipped** — the skipped case is #19, a real Pi RPC handshake that only runs when `PI_RPC_SMOKE=1` is set; normal regression runs leave it unset. Verified locally on Node v24.16.0; the repository declares no Node version requirement and adds no npm dependency management.
+Current suite: **458 passed** (including 44 cases in `tests/test_llm_explanation.py`). Proxy suite: **37 passed / 1 skipped** — the skipped case is #19, a real Pi RPC handshake that only runs when `PI_RPC_SMOKE=1` is set; normal regression runs leave it unset. Verified locally on Node v24.16.0; the repository declares no Node version requirement and adds no npm dependency management.
 
 The tests cover demand windows and trend boundaries, Level 1 math and status
 rules, in-transit aggregation, Level 2 constraint chains, fail-fast input
@@ -525,13 +579,15 @@ Implemented and tested:
   status).
 - In-transit handling (OPEN-only supply, overdue as risk).
 - Procurement Recommendation Level 2 (MOQ and order multiple).
+- Budget-Constrained Allocation Level 3 (R0 / R1 / R2; integer-cent budget,
+  per-cycle reset, optional audit columns).
 - Data-quality status and structured risk warnings.
 - Multi-day deterministic Simulator.
 - Audit Log (append-only JSONL projection).
 - LLM decision explanation layer (optional, disabled by default; explains only,
   never changes a number).
 
-Test suite: **262 passed**.
+Test suite: **458 passed**.
 
 ---
 
